@@ -30,11 +30,14 @@ TOKEN_FILE = os.path.join(BASE_DIR, "tokens.list")
 FALLBACK_TOKEN_FILE = os.path.join(BASE_DIR, "pass.txt")
 GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
+RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 LOG_BACKUPS = 5
 REPORT_BACKUPS = 3
 STATE_FLUSH_INTERVAL = 1.0
+CHECKPOINT_FLUSH_INTERVAL = 3.0
 MAX_SOCKET_CONCURRENCY = 600
 ADAPT_CHECK_INTERVAL = 2.0
 ADAPT_MIN_CONCURRENCY = 100
@@ -43,7 +46,7 @@ ADAPT_STEP_UP = 50
 ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
-EXPOSE_SECRET_IN_REPORT = True
+EXPOSE_SECRET_IN_REPORT = False
 MAX_EXPANDED_TARGETS_PER_ENTRY = 65536
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
@@ -140,14 +143,17 @@ def log_event(msg):
     append_rotating(LOG_FILE, f"[{stamp}] {msg}\n", MAX_LOG_BYTES, LOG_BACKUPS)
 
 
-def read_last_lines(path, lines=50):
-    if not os.path.exists(path):
-        return ""
+# --- 用这段代码替换原有的 read_last_lines 函数 ---
+def read_last_lines(path, lines=50, filter_keywords=None):
+    if not os.path.exists(path): return ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return "".join(f.readlines()[-lines:])
-    except OSError:
-        return ""
+            all_lines = f.readlines()
+            # 如果按键11或3传来了关键词，就只保留包含这些词的行
+            if filter_keywords:
+                all_lines = [l for l in all_lines if any(k in l for k in filter_keywords)]
+            return "".join(all_lines[-lines:])
+    except: return ""
 
 
 def mode_label(mode):
@@ -212,6 +218,31 @@ def default_telegram_config():
         "condition_mode": 2,
         "verified_threshold": 5,
     }
+
+
+def default_resume_config():
+    return {"enabled": True}
+
+
+def load_resume_config():
+    cfg = default_resume_config()
+    data = load_state(RESUME_CFG_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+    cfg["enabled"] = bool(cfg.get("enabled", True))
+    return cfg
+
+
+def save_resume_config(cfg):
+    save_state(RESUME_CFG_FILE, cfg)
+
+
+def clear_checkpoint():
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+    except OSError:
+        pass
 
 
 def load_telegram_config():
@@ -871,6 +902,18 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     save_state(STATE_FILE, state)
     state_lock = asyncio.Lock()
     flush_stop = asyncio.Event()
+    resume_cfg = load_resume_config()
+    resume_enabled = bool(resume_cfg.get("enabled", True))
+    session_key = f"{mode}|{work_mode}|{','.join(str(p) for p in ports)}"
+    done_targets = set()
+    if resume_enabled:
+        cp = load_state(CHECKPOINT_FILE)
+        if cp.get("session_key") == session_key:
+            raw_done = cp.get("done_targets", [])
+            if isinstance(raw_done, list):
+                done_targets = {str(x) for x in raw_done if str(x).strip()}
+    state["resume_enabled"] = resume_enabled
+    state["resume_restored"] = len(done_targets)
     tg_cfg = load_telegram_config()
     tg_enabled = (
         tg_cfg.get("enabled")
@@ -940,6 +983,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
     async def flush_state_loop():
         nonlocal last_interval_push_ts
+        last_checkpoint_ts = 0.0
         while not flush_stop.is_set():
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
             now = now_ts()
@@ -948,6 +992,21 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             recent_lines = []
             async with state_lock:
                 save_state(STATE_FILE, state)
+                if (
+                    resume_enabled
+                    and now - last_checkpoint_ts >= CHECKPOINT_FLUSH_INTERVAL
+                ):
+                    save_state(
+                        CHECKPOINT_FILE,
+                        {
+                            "session_key": session_key,
+                            "updated_at": now,
+                            "done_targets": sorted(done_targets),
+                            "done": state.get("done", 0),
+                            "total": state.get("total", 0),
+                        },
+                    )
+                    last_checkpoint_ts = now
                 if (
                     tg_enabled
                     and tg_interval_sec > 0
@@ -1057,6 +1116,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 async with state_lock:
                     state["done"] += 1
                     state["current"] = f"Completed -> {ip}"
+                    if resume_enabled:
+                        done_targets.add(ip)
                     need_special_or_push = (
                         tg_enabled
                         and tg_condition_mode == 4
@@ -1103,6 +1164,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         return
 
     seen_targets = set()
+    skipped_by_resume = 0
     try:
         for node_file in node_files:
             with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -1121,13 +1183,22 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                                 continue
                             seen_targets.add(target)
                             async with state_lock:
+                                state["total"] += 1
+                            if resume_enabled and target in done_targets:
+                                skipped_by_resume += 1
+                                async with state_lock:
+                                    state["done"] += 1
+                                    state["current"] = f"Resume skip -> {target}"
+                                continue
+                            async with state_lock:
                                 state["current"] = f"Feeding target -> {target}"
                             await q.put(target)
-                            async with state_lock:
-                                state["total"] += 1
                             await asyncio.sleep(feed_int)
     except OSError:
         pass
+
+    if skipped_by_resume > 0:
+        log_event(f"Resume restored {skipped_by_resume} completed targets")
 
     for _ in range(threads):
         await q.put(None)
@@ -1156,6 +1227,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
     if notify_tasks:
         await asyncio.gather(*list(notify_tasks), return_exceptions=True)
+    if state.get("done", 0) >= state.get("total", 0):
+        clear_checkpoint()
     save_state(STATE_FILE, state)
 
 
@@ -1200,6 +1273,7 @@ def main_console():
         print(f" 2) 监控面板  6) 启动守护")
         print(f" 3) 查看结果  10) Telegram推送")
         print(f" 4) 查看日志  8) 停止守护")
+        print(f" 7) 断点续连  11) 查看(发现)")
 
         c = input(
             f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}"
@@ -1338,6 +1412,25 @@ def main_console():
             print(f"{C_SUCC}>>> 守护进程已启动{C_W}")
             time.sleep(1)
 
+        elif c == "7":
+            rcfg = load_resume_config()
+            print(f"\n{C_CYAN}>>> 断点续连配置{C_W}")
+            print(f"当前状态: {'启用' if rcfg.get('enabled', True) else '关闭'}")
+            print("1) 开启  2) 关闭  3) 清空断点")
+            sel = input("请选择 (默认回车返回): ").strip()
+            if sel == "1":
+                rcfg["enabled"] = True
+                save_resume_config(rcfg)
+                print(f"{C_SUCC}>>> 已开启断点续连{C_W}")
+            elif sel == "2":
+                rcfg["enabled"] = False
+                save_resume_config(rcfg)
+                print(f"{C_WARN}>>> 已关闭断点续连{C_W}")
+            elif sel == "3":
+                clear_checkpoint()
+                print(f"{C_SUCC}>>> 断点记录已清空{C_W}")
+            time.sleep(1)
+
         elif c == "10":
             cfg = load_telegram_config()
             print(f"\n{C_CYAN}>>> Telegram 推送配置{C_W}")
@@ -1405,6 +1498,11 @@ def main_console():
 
         elif c == "9":
             break
+        # --- 【新增】在这里插入按键 11 的代码 ---
+        elif c == "11":
+            # 这里的 filter_keywords 确保按11只看“存活”但“未验证”的
+            print(f"\n{C_CYAN}>>> 发现资产列表 (存活在线){C_W}\n" + read_last_lines(REPORT_FILE, filter_keywords=["存活", "连通", "加密节点"]))
+            input("\n回车返回")
 
 
 if __name__ == "__main__":
