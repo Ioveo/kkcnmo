@@ -26,6 +26,12 @@ MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 LOG_BACKUPS = 5
 REPORT_BACKUPS = 3
+DEFAULT_XUI_PORTS = "54321,2053"
+DEFAULT_S5_PORTS = (
+    "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
+    "1234,4321,8000,9000,6868,6688,8866,9527,1472,2583,3694,10000-10010"
+)
+DEFAULT_MIXED_PORTS = f"{DEFAULT_XUI_PORTS},{DEFAULT_S5_PORTS}"
 
 # 颜色配置
 C_BOLD, C_W = "\033[1m", "\033[0m"
@@ -153,7 +159,69 @@ def prompt_int(msg, default, min_value=None, max_value=None):
         return value
 
 
-def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20):
+def prompt_float(msg, default, min_value=None):
+    while True:
+        raw = input(msg).strip()
+        if not raw:
+            value = default
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                print("输入无效，请输入数字。")
+                continue
+        if min_value is not None and value < min_value:
+            print(f"输入过小，最小值为 {min_value}。")
+            continue
+        return value
+
+
+def get_available_memory_mb():
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullAvailPhys / 1024 / 1024
+        return None
+
+    if sys.platform.startswith("freebsd"):
+        try:
+            page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True).strip())
+            free_pages = int(subprocess.check_output(["sysctl", "-n", "vm.stats.vm.v_free_count"], text=True).strip())
+            inactive_pages = int(subprocess.check_output(["sysctl", "-n", "vm.stats.vm.v_inactive_count"], text=True).strip())
+            cache_pages = int(subprocess.check_output(["sysctl", "-n", "vm.stats.vm.v_cache_count"], text=True).strip())
+            return (page_size * (free_pages + inactive_pages + cache_pages)) / 1024 / 1024
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+
+    meminfo = "/proc/meminfo"
+    if os.path.exists(meminfo):
+        try:
+            with open(meminfo, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return int(parts[1]) / 1024
+        except OSError:
+            return None
+    return None
+
+
+def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20, min_free_mb=256.0):
     save_state(
         GUARDIAN_STATE_FILE,
         {
@@ -163,27 +231,42 @@ def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20):
             "threads": threads,
             "ports": ports_str,
             "updated_at": now_ts(),
+            "min_free_mb": min_free_mb,
+            "check_interval": check_interval,
+            "feed_int": feed_int,
         },
     )
-    log_event(f"Guardian started mode={mode} threads={threads} ports={ports_str}")
+    log_event(
+        f"Guardian started mode={mode} threads={threads} ports={ports_str} "
+        f"feed_int={feed_int} check_interval={check_interval}s min_free_mb={min_free_mb}"
+    )
     while True:
         st = load_state(STATE_FILE)
         if not is_alive(st.get("pid")):
-            subprocess.Popen(
-                [
-                    sys.executable,
-                    __file__,
-                    "run",
-                    str(mode),
-                    str(threads),
-                    ports_str,
-                    str(feed_int),
-                ],
-                start_new_session=True,
-            )
-            log_event("Guardian restarted audit process")
+            mem_mb = get_available_memory_mb()
+            if mem_mb is None or mem_mb >= min_free_mb:
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        __file__,
+                        "run",
+                        str(mode),
+                        str(threads),
+                        ports_str,
+                        str(feed_int),
+                    ],
+                    start_new_session=True,
+                )
+                log_event(
+                    f"Guardian restarted audit process (free_mem={mem_mb:.0f}MB)"
+                    if mem_mb is not None
+                    else "Guardian restarted audit process"
+                )
+            else:
+                log_event(f"Guardian wait: low memory {mem_mb:.0f}MB < {min_free_mb:.0f}MB")
         gs = load_state(GUARDIAN_STATE_FILE)
         gs["updated_at"] = now_ts()
+        gs["last_free_mb"] = mem_mb if 'mem_mb' in locals() else get_available_memory_mb()
         save_state(GUARDIAN_STATE_FILE, gs)
         time.sleep(check_interval)
 
@@ -198,6 +281,7 @@ async def audit_xui(ip, port, state):
         await writer.drain()
         data = await asyncio.wait_for(r.read(512), timeout=2.0)
         if b"x-ui" in data.lower() or b"login" in data.lower():
+            state["xui_found"] += 1
             state["xui_verified"] += 1 # 探测到在线面板即记为验证成功
             return f"Asset[X-UI]: {ip}:{port} | 状态: 验证成功-面板在线"
     except (asyncio.TimeoutError, OSError):
@@ -264,7 +348,7 @@ async def internal_audit_process(mode, threads, ports, feed_int):
     state = {
         "status": "running", "pid": os.getpid(), 
         "total": 0, "done": 0, 
-        "xui_verified": 0, "s5_found": 0, "s5_verified": 0,
+        "xui_found": 0, "xui_verified": 0, "s5_found": 0, "s5_verified": 0,
         "recent": [], "started_at": now_ts()
     }
     save_state(STATE_FILE, state)
@@ -346,12 +430,16 @@ def main_console():
             print("\n1.XUI专项 | 2.S5专项 | 3.深度全能审计")
             m = prompt_int("模式 (1-3): ", default=3, min_value=1, max_value=3)
             th = prompt_int("线程 (默认20): ", default=20, min_value=1, max_value=500)
-            ps = input("端口 (默认 54321,2052,1080-1090): ") or "54321,2052,1080-1090"
+            fi = prompt_float("IP 调用间隔秒 (默认0.02): ", default=0.02, min_value=0.0)
+            default_ports = (
+                DEFAULT_XUI_PORTS if m == 1 else DEFAULT_S5_PORTS if m == 2 else DEFAULT_MIXED_PORTS
+            )
+            ps = input(f"端口 (默认 {default_ports}): ") or default_ports
             if not parse_ports(ps):
                 print("端口格式无效。")
                 time.sleep(1)
                 continue
-            subprocess.Popen([sys.executable, __file__, "run", str(m), str(th), ps, "0.02"], start_new_session=True)
+            subprocess.Popen([sys.executable, __file__, "run", str(m), str(th), ps, str(fi)], start_new_session=True)
             print("审计已提交后台运行。")
             time.sleep(1)
         elif c == "2":
@@ -362,7 +450,7 @@ def main_console():
                     os.system("cls" if os.name == "nt" else "clear")
                     print(f"{C_BLUE}SAIA v20.0 | 双排监控{C_W}")
                     print(f"[进度总控] {done}/{total} | 状态: {st.get('status','-')}")
-                    print(f"{C_PROC}[第一排 X-UI]{C_W} 验证成功: {st.get('xui_verified', 0)}")
+                    print(f"{C_PROC}[第一排 X-UI]{C_W} 发现面板: {st.get('xui_found', 0)} | 验证成功: {st.get('xui_verified', 0)}")
                     print(f"{C_SUCC}[第二排 SOCKS5]{C_W} 发现节点: {st.get('s5_found', 0)} | 验真成功: {st.get('s5_verified', 0)}")
                     print("\nCtrl+C 返回菜单")
                     time.sleep(1)
@@ -389,12 +477,31 @@ def main_console():
         elif c == "6":
             m = prompt_int("守护模式 (1-3): ", default=3, min_value=1, max_value=3)
             th = prompt_int("守护线程 (默认10): ", default=10, min_value=1, max_value=500)
-            ps = input("守护端口 (默认 54321,2052,1080-1090): ") or "54321,2052,1080-1090"
+            fi = prompt_float("守护启动时 IP 调用间隔秒 (默认0.05): ", default=0.05, min_value=0.0)
+            ci = prompt_float("守护检查间隔秒 (默认20): ", default=20.0, min_value=1.0)
+            mm = prompt_float("最低可用内存MB阈值 (默认256): ", default=256.0, min_value=32.0)
+            default_ports = (
+                DEFAULT_XUI_PORTS if m == 1 else DEFAULT_S5_PORTS if m == 2 else DEFAULT_MIXED_PORTS
+            )
+            ps = input(f"守护端口 (默认 {default_ports}): ") or default_ports
             if not parse_ports(ps):
                 print("端口格式无效。")
                 time.sleep(1)
                 continue
-            subprocess.Popen([sys.executable, __file__, "guardian", str(m), str(th), ps], start_new_session=True)
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    __file__,
+                    "guardian",
+                    str(m),
+                    str(th),
+                    ps,
+                    str(fi),
+                    str(ci),
+                    str(mm),
+                ],
+                start_new_session=True,
+            )
             print("守护已启动。")
             time.sleep(1)
         elif c == "8":
@@ -428,7 +535,23 @@ if __name__ == "__main__":
         asyncio.run(internal_audit_process(mode, threads, ports, feed_int))
     elif len(sys.argv) > 1 and sys.argv[1] == "guardian":
         if len(sys.argv) < 5:
-            raise SystemExit("参数不足: guardian <mode> <threads> <ports>")
-        run_guardian(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+            raise SystemExit("参数不足: guardian <mode> <threads> <ports> [feed_int] [check_interval] [min_free_mb]")
+        feed_int = float(sys.argv[5]) if len(sys.argv) > 5 else 0.05
+        check_interval = float(sys.argv[6]) if len(sys.argv) > 6 else 20.0
+        min_free_mb = float(sys.argv[7]) if len(sys.argv) > 7 else 256.0
+        if feed_int < 0:
+            raise SystemExit("feed_int 不能小于 0")
+        if check_interval < 1:
+            raise SystemExit("check_interval 不能小于 1")
+        if min_free_mb < 32:
+            raise SystemExit("min_free_mb 不能小于 32")
+        run_guardian(
+            int(sys.argv[2]),
+            int(sys.argv[3]),
+            sys.argv[4],
+            feed_int=feed_int,
+            check_interval=check_interval,
+            min_free_mb=min_free_mb,
+        )
     else:
         main_console()
