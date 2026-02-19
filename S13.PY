@@ -9,6 +9,7 @@ import json
 import signal
 import subprocess
 import ctypes
+import ssl
 from datetime import datetime
 
 # ============================================================
@@ -20,7 +21,10 @@ STATE_FILE = os.path.join(BASE_DIR, "sys_audit_state.json")
 LOG_FILE = os.path.join(BASE_DIR, "sys_audit_events.log")
 REPORT_FILE = os.path.join(BASE_DIR, "audit_report.log")
 NODE_FILE = os.path.join(BASE_DIR, "nodes.list")
+FALLBACK_NODE_FILE = os.path.join(BASE_DIR, "ip.txt")
+FALLBACK_NODE_FILE_UPPER = os.path.join(BASE_DIR, "IP.TXT")
 TOKEN_FILE = os.path.join(BASE_DIR, "tokens.list")
+FALLBACK_TOKEN_FILE = os.path.join(BASE_DIR, "pass.txt")
 GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
@@ -110,6 +114,46 @@ def read_last_lines(path, lines=50):
             return "".join(f.readlines()[-lines:])
     except OSError:
         return ""
+
+
+def pick_one_verified_result():
+    if not os.path.exists(REPORT_FILE):
+        return None
+    try:
+        with open(REPORT_FILE, "r", encoding="utf-8", errors="replace") as f:
+            rows = [line.strip() for line in f if line.strip()]
+        verified_rows = [r for r in rows if "验证成功" in r]
+        if not verified_rows:
+            return None
+        return random.choice(verified_rows)
+    except OSError:
+        return None
+
+
+def render_progress_bar(done, total, width=28):
+    if total <= 0:
+        return "[" + ("-" * width) + "] 0.0%"
+    ratio = max(0.0, min(1.0, done / total))
+    fill = int(width * ratio)
+    return "[" + ("#" * fill) + ("-" * (width - fill)) + f"] {ratio * 100:5.1f}%"
+
+
+def resolve_node_file():
+    if os.path.exists(FALLBACK_NODE_FILE_UPPER):
+        return FALLBACK_NODE_FILE_UPPER
+    if os.path.exists(NODE_FILE):
+        return NODE_FILE
+    if os.path.exists(FALLBACK_NODE_FILE):
+        return FALLBACK_NODE_FILE
+    return None
+
+
+def resolve_token_file():
+    if os.path.exists(TOKEN_FILE):
+        return TOKEN_FILE
+    if os.path.exists(FALLBACK_TOKEN_FILE):
+        return FALLBACK_TOKEN_FILE
+    return None
 
 def is_alive(pid):
     if not pid or pid <= 0:
@@ -274,20 +318,62 @@ def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20, min
 
 async def audit_xui(ip, port, state):
     """X-UI 探测与验证"""
-    writer = None
-    try:
-        r, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=2.5)
-        writer.write(f"GET /login HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode())
-        await writer.drain()
-        data = await asyncio.wait_for(r.read(512), timeout=2.0)
-        if b"x-ui" in data.lower() or b"login" in data.lower():
+    async def fetch_page(path, use_ssl=False):
+        writer = None
+        try:
+            ssl_ctx = ssl.create_default_context() if use_ssl else None
+            if ssl_ctx is not None:
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, ssl=ssl_ctx if use_ssl else None),
+                timeout=3.0,
+            )
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {ip}\r\n"
+                "User-Agent: SAIA/20.0\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            writer.write(req.encode("utf-8", errors="ignore"))
+            await writer.drain()
+            return await asyncio.wait_for(reader.read(16384), timeout=4.0)
+        except (asyncio.TimeoutError, OSError, ssl.SSLError):
+            return b""
+        finally:
+            await close_writer(writer)
+
+    def match_xui(data):
+        if not data:
+            return False
+        low = data.lower()
+        strong_markers = (b"x-ui", b"3x-ui", b"/xui")
+        if any(m in low for m in strong_markers):
+            return True
+        if b"/login" in low and (b"username" in low or b"password" in low):
+            return True
+        if b"location:" in low and (b"/login" in low or b"/xui" in low):
+            return True
+        if b"http/1.1 200" in low and b"content-type: text/html" in low and b"<title>" in low and b"login" in low:
+            return True
+        return False
+
+    probes = [
+        ("/", False),
+        ("/login", False),
+        ("/xui", False),
+        ("/", True),
+        ("/login", True),
+        ("/xui", True),
+    ]
+
+    for path, use_ssl in probes:
+        data = await fetch_page(path, use_ssl=use_ssl)
+        if match_xui(data):
             state["xui_found"] += 1
-            state["xui_verified"] += 1 # 探测到在线面板即记为验证成功
-            return f"Asset[X-UI]: {ip}:{port} | 状态: 验证成功-面板在线"
-    except (asyncio.TimeoutError, OSError):
-        pass
-    finally:
-        await close_writer(writer)
+            state["xui_verified"] += 1
+            proto = "https" if use_ssl else "http"
+            return f"Asset[X-UI]: {ip}:{port} | 状态: 验证成功-面板在线 | 协议: {proto} | 路径: {path}"
     return None
 
 async def audit_socks5(ip, port, tokens, state):
@@ -349,17 +435,21 @@ async def internal_audit_process(mode, threads, ports, feed_int):
         "status": "running", "pid": os.getpid(), 
         "total": 0, "done": 0, 
         "xui_found": 0, "xui_verified": 0, "s5_found": 0, "s5_verified": 0,
-        "recent": [], "started_at": now_ts()
+        "recent": [], "started_at": now_ts(), "current": "Initializing..."
     }
     save_state(STATE_FILE, state)
     log_event(f"Audit started mode={mode} threads={threads} ports={len(ports)}")
     
     tokens = []
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r", encoding="utf-8", errors="ignore") as f:
+    token_file = resolve_token_file()
+    if token_file:
+        log_event(f"Using token file: {os.path.basename(token_file)}")
+        with open(token_file, "r", encoding="utf-8", errors="ignore") as f:
             for l in f:
                 l = l.strip()
                 if l: tokens.append(l.split(":", 1) if ":" in l else ["admin", l])
+    else:
+        log_event("Token file not found: tokens.list/pass.txt")
 
     q = asyncio.Queue(maxsize=threads*2)
     
@@ -370,6 +460,7 @@ async def internal_audit_process(mode, threads, ports, feed_int):
                 q.task_done()
                 break
             try:
+                state["current"] = f"Auditing -> {ip}"
                 for p in ports:
                     found_res = []
                     # 模式 1/3：独立验证 X-UI
@@ -393,24 +484,35 @@ async def internal_audit_process(mode, threads, ports, feed_int):
                             )
                         break
                 state["done"] += 1
+                state["current"] = f"Completed -> {ip}"
                 if state["done"] % 10 == 0: save_state(STATE_FILE, state)
             finally:
                 q.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(threads)]
     
+    node_file = resolve_node_file()
+    if not node_file:
+        state["status"] = "completed"
+        save_state(STATE_FILE, state)
+        log_event("Audit aborted: nodes.list/ip.txt not found")
+        return
+
+    log_event(f"Using target file: {os.path.basename(node_file)}")
+
     try:
-        with open(NODE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+        with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 line = line.strip()
                 if not line: continue
+                state["current"] = f"Feeding target -> {line}"
                 await q.put(line); state["total"] += 1; await asyncio.sleep(feed_int)
     except OSError:
         pass
 
     for _ in range(threads): await q.put(None)
     await asyncio.gather(*workers)
-    state["status"] = "completed"; save_state(STATE_FILE, state)
+    state["status"] = "completed"; state["current"] = "Completed"; save_state(STATE_FILE, state)
     log_event(f"Audit completed done={state['done']} total={state['total']}")
 
 # ==================== 管理界面 (双排显示) ====================
@@ -423,7 +525,7 @@ def main_console():
         print(f"进程: {'ON' if is_alive(s.get('pid')) else 'OFF'} | 守护: {'ON' if is_alive(g.get('pid')) else 'OFF'}")
         print("-" * 55)
         print("1) 启动审计 | 2) 进入双排监控 | 3) 查看审计结果 | 4) 查看系统日志")
-        print("5) 终止审计 | 6) 启动守护 | 8) 停止守护 | 9) 退出")
+        print("5) 终止审计 | 6) 启动守护 | 7) 抽取一条已验证结果 | 8) 停止守护 | 9) 退出")
         
         c = input("\n请选择指令: ").strip()
         if c == "1":
@@ -447,11 +549,13 @@ def main_console():
                 while True:
                     st = load_state(STATE_FILE)
                     done = st.get('done', 0); total = st.get('total', 0)
+                    bar = render_progress_bar(done, total)
                     os.system("cls" if os.name == "nt" else "clear")
                     print(f"{C_BLUE}SAIA v20.0 | 双排监控{C_W}")
-                    print(f"[进度总控] {done}/{total} | 状态: {st.get('status','-')}")
                     print(f"{C_PROC}[第一排 X-UI]{C_W} 发现面板: {st.get('xui_found', 0)} | 验证成功: {st.get('xui_verified', 0)}")
                     print(f"{C_SUCC}[第二排 SOCKS5]{C_W} 发现节点: {st.get('s5_found', 0)} | 验真成功: {st.get('s5_verified', 0)}")
+                    print(f"{C_Y}[第三排 工作状态]{C_W} 进度: {bar} ({done}/{total}) | 状态: {st.get('status','-')}")
+                    print(f"当前任务: {st.get('current', '-')}")
                     print("\nCtrl+C 返回菜单")
                     time.sleep(1)
             except KeyboardInterrupt:
@@ -504,6 +608,21 @@ def main_console():
             )
             print("守护已启动。")
             time.sleep(1)
+        elif c == "7":
+            picked = pick_one_verified_result()
+            if not picked:
+                print("没有可提取的已验证结果。")
+            else:
+                print(f"抽取结果: {picked}")
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                append_rotating(
+                    os.path.join(BASE_DIR, "verified_pick.txt"),
+                    f"[{stamp}] {picked}\n",
+                    512 * 1024,
+                    3,
+                )
+                print("已写入 verified_pick.txt")
+            input("\n按回车返回...")
         elif c == "8":
             gpid = load_state(GUARDIAN_STATE_FILE).get("pid")
             if is_alive(gpid):
