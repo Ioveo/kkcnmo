@@ -204,12 +204,26 @@ def collect_report_sections(limit=120):
                     "[节点-可连通]" in line
                     or "[资产-加密节点]" in line
                     or "Node[S5" in line
+                    or "SOCKS5" in line.upper()
+                    or "S5" in line.upper()
                     or "S5-OPEN" in line
                     or "S5-AUTH" in line
                     or "需认证" in line
                 )
-                is_s5_verified = "[优质-真穿透]" in line or (
-                    "Node[S5" in line and ("验证成功" in line or "认证通过" in line)
+                is_s5_verified = (
+                    "[优质-真穿透]" in line
+                    or (
+                        "Node[S5" in line and ("验证成功" in line or "认证通过" in line)
+                    )
+                    or (
+                        ("S5" in line.upper() or "SOCKS5" in line.upper())
+                        and (
+                            "验证成功" in line
+                            or "认证通过" in line
+                            or "真穿透" in line
+                            or "RTT:" in line
+                        )
+                    )
                 )
 
                 if is_xui_audited:
@@ -239,6 +253,13 @@ def merge_recent_lines(base_lines, recent_lines, limit=120):
             out.append(line)
             seen.add(line)
     return out[-limit:]
+
+
+def latest_ip_port(lines):
+    if not lines:
+        return "-"
+    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})", lines[-1])
+    return m.group(1) if m else "-"
 
 
 def mode_label(mode):
@@ -1054,7 +1075,7 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode, conn_limiter
                 if check_auth_success(login_resp):
                     async with state_lock:
                         state["xui_verified"] += 1
-                    return f"[高危-后台沦陷] {ip}:{port}:{u}:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
+                    return f"[高危-后台沦陷] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
 
         if work_mode == 2:
             proto, _, country, asn, _ = found_candidates[0]
@@ -1161,9 +1182,9 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                         if l7_ok:
                             async with state_lock:
                                 state["s5_verified"] += 1
-                            return f"[优质-真穿透] {ip}:{port}:{u}:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
+                            return f"[优质-真穿透] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
                         elif work_mode == 2:
-                            return f"[节点-可连通] {ip}:{port}:{u}:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
+                            return f"[节点-可连通] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
                 except (asyncio.TimeoutError, OSError, ValueError):
                     continue
                 finally:
@@ -1716,10 +1737,15 @@ def main_console():
         print(f" 7) 断点续连  11) S5审计/验真")
         print(f" 12) 进料加速策略")
 
-        c = timed_input(
-            f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}",
-            timeout_sec=10.0,
-        ).strip()
+        try:
+            c = timed_input(
+                f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}",
+                timeout_sec=10.0,
+            ).strip()
+        except KeyboardInterrupt:
+            print(f"\n{C_DIM}已取消输入，返回主菜单刷新...{C_W}")
+            time.sleep(0.4)
+            continue
         if not c:
             continue
 
@@ -1816,6 +1842,7 @@ def main_console():
 
         elif c == "3":
             try:
+                last_sig = None
                 while True:
                     st = load_state(STATE_FILE)
                     xui_audited, xui_verified, _, _ = collect_report_sections(limit=120)
@@ -1846,25 +1873,38 @@ def main_console():
                     xui_verified = merge_recent_lines(
                         xui_verified, xui_recent_verified, 120
                     )
-                    os.system("cls" if os.name == "nt" else "clear")
-                    print(f"\n{C_CYAN}>>> X-UI 审计实时面板{C_W}")
-                    print(
-                        f"已审计: {C_CYAN}{st.get('xui_found', 0)}{C_W} | 已验真: {C_WARN}{st.get('xui_verified', 0)}{C_W} | 刷新: 1s"
+                    sig = (
+                        int(st.get("xui_found", 0)),
+                        int(st.get("xui_verified", 0)),
+                        len(xui_audited),
+                        len(xui_verified),
+                        xui_audited[-1] if xui_audited else "",
+                        xui_verified[-1] if xui_verified else "",
                     )
-                    print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
-                    print(
-                        "\n".join(xui_audited[-40:])
-                        if xui_audited
-                        else f"{C_DIM}暂无X-UI审计数据{C_W}"
-                    )
-                    print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
-                    print(
-                        "\n".join(xui_verified[-40:])
-                        if xui_verified
-                        else f"{C_DIM}暂无X-UI验真数据{C_W}"
-                    )
-                    print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
-                    time.sleep(1.0)
+                    if sig != last_sig:
+                        last_sig = sig
+                        os.system("cls" if os.name == "nt" else "clear")
+                        print(f"\n{C_CYAN}>>> X-UI 审计实时面板(有新结果才刷新){C_W}")
+                        print(
+                            f"已审计: {C_CYAN}{st.get('xui_found', 0)}{C_W} | 已验真: {C_WARN}{st.get('xui_verified', 0)}{C_W}"
+                        )
+                        print(
+                            f"最新IP: 审计 {C_CYAN}{latest_ip_port(xui_audited)}{C_W} | 验真 {C_WARN}{latest_ip_port(xui_verified)}{C_W}"
+                        )
+                        print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
+                        print(
+                            "\n".join(xui_audited[-120:])
+                            if xui_audited
+                            else f"{C_DIM}暂无X-UI审计数据{C_W}"
+                        )
+                        print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
+                        print(
+                            "\n".join(xui_verified[-120:])
+                            if xui_verified
+                            else f"{C_DIM}暂无X-UI验真数据{C_W}"
+                        )
+                        print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
+                    time.sleep(0.5)
             except KeyboardInterrupt:
                 pass
 
@@ -2042,6 +2082,7 @@ def main_console():
             break
         elif c == "11":
             try:
+                last_sig = None
                 while True:
                     st = load_state(STATE_FILE)
                     _, _, s5_audited, s5_verified = collect_report_sections(limit=120)
@@ -2056,6 +2097,8 @@ def main_console():
                             "[节点-可连通]" in l
                             or "[资产-加密节点]" in l
                             or "Node[S5" in l
+                            or "SOCKS5" in l.upper()
+                            or "S5" in l.upper()
                             or "S5-OPEN" in l
                             or "S5-AUTH" in l
                             or "需认证" in l
@@ -2067,31 +2110,53 @@ def main_console():
                         if (
                             "[优质-真穿透]" in l
                             or ("Node[S5" in l and ("验证成功" in l or "认证通过" in l))
+                            or (
+                                ("S5" in l.upper() or "SOCKS5" in l.upper())
+                                and (
+                                    "验证成功" in l
+                                    or "认证通过" in l
+                                    or "真穿透" in l
+                                    or "RTT:" in l
+                                )
+                            )
                         )
                     ]
                     s5_audited = merge_recent_lines(s5_audited, s5_recent_audited, 120)
                     s5_verified = merge_recent_lines(
                         s5_verified, s5_recent_verified, 120
                     )
-                    os.system("cls" if os.name == "nt" else "clear")
-                    print(f"\n{C_CYAN}>>> S5 审计实时面板{C_W}")
-                    print(
-                        f"已审计: {C_CYAN}{st.get('s5_found', 0)}{C_W} | 已验真: {C_SUCC}{st.get('s5_verified', 0)}{C_W} | 刷新: 1s"
+                    sig = (
+                        int(st.get("s5_found", 0)),
+                        int(st.get("s5_verified", 0)),
+                        len(s5_audited),
+                        len(s5_verified),
+                        s5_audited[-1] if s5_audited else "",
+                        s5_verified[-1] if s5_verified else "",
                     )
-                    print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
-                    print(
-                        "\n".join(s5_audited[-40:])
-                        if s5_audited
-                        else f"{C_DIM}暂无S5审计数据{C_W}"
-                    )
-                    print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
-                    print(
-                        "\n".join(s5_verified[-40:])
-                        if s5_verified
-                        else f"{C_DIM}暂无S5验真数据{C_W}"
-                    )
-                    print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
-                    time.sleep(1.0)
+                    if sig != last_sig:
+                        last_sig = sig
+                        os.system("cls" if os.name == "nt" else "clear")
+                        print(f"\n{C_CYAN}>>> S5 审计实时面板(有新结果才刷新){C_W}")
+                        print(
+                            f"已审计: {C_CYAN}{st.get('s5_found', 0)}{C_W} | 已验真: {C_SUCC}{st.get('s5_verified', 0)}{C_W}"
+                        )
+                        print(
+                            f"最新IP: 审计 {C_CYAN}{latest_ip_port(s5_audited)}{C_W} | 验真 {C_SUCC}{latest_ip_port(s5_verified)}{C_W}"
+                        )
+                        print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
+                        print(
+                            "\n".join(s5_audited[-120:])
+                            if s5_audited
+                            else f"{C_DIM}暂无S5审计数据{C_W}"
+                        )
+                        print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
+                        print(
+                            "\n".join(s5_verified[-120:])
+                            if s5_verified
+                            else f"{C_DIM}暂无S5验真数据{C_W}"
+                        )
+                        print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
+                    time.sleep(0.5)
             except KeyboardInterrupt:
                 pass
 
