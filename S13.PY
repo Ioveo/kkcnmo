@@ -13,12 +13,13 @@ import ssl
 import re
 import unicodedata
 import select
+import traceback
 import urllib.parse
 import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) 
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +34,7 @@ FALLBACK_TOKEN_FILE = os.path.join(BASE_DIR, "pass.txt")
 GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
+FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
@@ -41,6 +43,9 @@ REPORT_BACKUPS = 3
 STATE_FLUSH_INTERVAL = 1.0
 CHECKPOINT_FLUSH_INTERVAL = 3.0
 MAX_SOCKET_CONCURRENCY = 600
+FEED_ACCEL_TRIGGER_RATIO = 0.5
+FEED_FINAL_RUSH_RATIO = 0.1
+FEED_ACCEL_FACTOR = 0.5
 ADAPT_CHECK_INTERVAL = 2.0
 ADAPT_MIN_CONCURRENCY = 100
 ADAPT_MAX_CONCURRENCY = 1000
@@ -145,6 +150,17 @@ def log_event(msg):
     append_rotating(LOG_FILE, f"[{stamp}] {msg}\n", MAX_LOG_BYTES, LOG_BACKUPS)
 
 
+def log_exception(context):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tb = traceback.format_exc()
+    append_rotating(
+        LOG_FILE,
+        f"[{stamp}] EXCEPTION: {context}\n{tb}\n",
+        MAX_LOG_BYTES,
+        LOG_BACKUPS,
+    )
+
+
 # --- 用这段代码替换原有的 read_last_lines 函数 ---
 def read_last_lines(path, lines=50, filter_keywords=None):
     if not os.path.exists(path):
@@ -160,6 +176,69 @@ def read_last_lines(path, lines=50, filter_keywords=None):
             return "".join(all_lines[-lines:])
     except:
         return ""
+
+
+def collect_report_sections(limit=120):
+    xui_audited, xui_verified = [], []
+    s5_audited, s5_verified = [], []
+    if not os.path.exists(REPORT_FILE):
+        return xui_audited, xui_verified, s5_audited, s5_verified
+
+    try:
+        with open(REPORT_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+
+                is_xui_audited = (
+                    "[资产-面板存活]" in line
+                    or "Asset[X-UI]" in line
+                    or "面板在线" in line
+                )
+                is_xui_verified = "[高危-后台沦陷]" in line or (
+                    "Asset[X-UI]" in line and "验真成功" in line
+                )
+
+                is_s5_audited = (
+                    "[节点-可连通]" in line
+                    or "[资产-加密节点]" in line
+                    or "Node[S5" in line
+                    or "S5-OPEN" in line
+                    or "S5-AUTH" in line
+                    or "需认证" in line
+                )
+                is_s5_verified = "[优质-真穿透]" in line or (
+                    "Node[S5" in line and ("验证成功" in line or "认证通过" in line)
+                )
+
+                if is_xui_audited:
+                    xui_audited.append(line)
+                if is_xui_verified:
+                    xui_verified.append(line)
+                if is_s5_audited:
+                    s5_audited.append(line)
+                if is_s5_verified:
+                    s5_verified.append(line)
+    except OSError:
+        pass
+
+    return (
+        xui_audited[-limit:],
+        xui_verified[-limit:],
+        s5_audited[-limit:],
+        s5_verified[-limit:],
+    )
+
+
+def merge_recent_lines(base_lines, recent_lines, limit=120):
+    out = list(base_lines)
+    seen = set(out)
+    for line in recent_lines:
+        if line and line not in seen:
+            out.append(line)
+            seen.add(line)
+    return out[-limit:]
 
 
 def mode_label(mode):
@@ -241,6 +320,51 @@ def load_resume_config():
 
 def save_resume_config(cfg):
     save_state(RESUME_CFG_FILE, cfg)
+
+
+def default_feed_turbo_config():
+    return {
+        "accel_trigger_ratio": FEED_ACCEL_TRIGGER_RATIO,
+        "final_rush_ratio": FEED_FINAL_RUSH_RATIO,
+        "accel_factor": FEED_ACCEL_FACTOR,
+    }
+
+
+def load_feed_turbo_config():
+    cfg = default_feed_turbo_config()
+    data = load_state(FEED_CFG_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+
+    try:
+        trigger = float(cfg.get("accel_trigger_ratio", FEED_ACCEL_TRIGGER_RATIO))
+    except (TypeError, ValueError):
+        trigger = FEED_ACCEL_TRIGGER_RATIO
+    trigger = max(0.0, min(1.0, trigger))
+
+    try:
+        final_rush = float(cfg.get("final_rush_ratio", FEED_FINAL_RUSH_RATIO))
+    except (TypeError, ValueError):
+        final_rush = FEED_FINAL_RUSH_RATIO
+    final_rush = max(0.0, min(1.0, final_rush))
+
+    try:
+        factor = float(cfg.get("accel_factor", FEED_ACCEL_FACTOR))
+    except (TypeError, ValueError):
+        factor = FEED_ACCEL_FACTOR
+    factor = max(0.0, min(1.0, factor))
+
+    if final_rush > trigger:
+        final_rush = trigger
+
+    cfg["accel_trigger_ratio"] = trigger
+    cfg["final_rush_ratio"] = final_rush
+    cfg["accel_factor"] = factor
+    return cfg
+
+
+def save_feed_turbo_config(cfg):
+    save_state(FEED_CFG_FILE, cfg)
 
 
 def clear_checkpoint():
@@ -776,10 +900,25 @@ def run_guardian(
     )
     last_restart_ts = 0.0
     min_restart_gap = max(10.0, float(check_interval))
+    completed_notice_logged = False
     while True:
         mem_mb = get_available_memory_mb()
         st = load_state(STATE_FILE)
         if not is_alive(st.get("pid")):
+            st_status = str(st.get("status", "")).lower()
+            if st_status == "completed":
+                if not completed_notice_logged:
+                    log_event(
+                        "Guardian idle: last audit completed, waiting manual restart"
+                    )
+                    completed_notice_logged = True
+                gs = load_state(GUARDIAN_STATE_FILE)
+                gs["updated_at"] = now_ts()
+                gs["last_free_mb"] = mem_mb
+                gs["last_note"] = "idle_completed"
+                save_state(GUARDIAN_STATE_FILE, gs)
+                time.sleep(check_interval)
+                continue
             if mem_mb is None or mem_mb >= min_free_mb:
                 now = now_ts()
                 if now - last_restart_ts >= min_restart_gap:
@@ -797,10 +936,13 @@ def run_guardian(
                         start_new_session=True,
                     )
                     last_restart_ts = now
+                    completed_notice_logged = False
             else:
                 log_event(
                     f"Guardian wait: low memory {mem_mb:.0f}MB < {min_free_mb:.0f}MB"
                 )
+        else:
+            completed_notice_logged = False
         gs = load_state(GUARDIAN_STATE_FILE)
         gs["updated_at"] = now_ts()
         gs["last_free_mb"] = mem_mb
@@ -944,7 +1086,7 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
         writer.write(b"\x05\x02\x00\x02")
         await writer.drain()
         res = await asyncio.wait_for(r.read(2), timeout=2.0)
-        if not res or res[0] != 5:
+        if not res or len(res) < 2 or res[0] != 5:
             return None
 
         if res[1] == 0x00:
@@ -965,7 +1107,7 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                 w2.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
                 await w2.drain()
                 ack = await asyncio.wait_for(r2.read(10), timeout=2.5)
-                if ack and ack[1] == 0x00:
+                if ack and len(ack) >= 2 and ack[1] == 0x00:
                     lat = int((time.perf_counter() - start) * 1000)
                     l7_ok = await check_l7(r2, w2)
                     if l7_ok:
@@ -1005,14 +1147,14 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                     )
                     await w3.drain()
                     auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
-                    if auth and auth[1] == 0x00:
+                    if auth and len(auth) >= 2 and auth[1] == 0x00:
                         start = time.perf_counter()
                         w3.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
                         await w3.drain()
                         ack = await asyncio.wait_for(r3.read(10), timeout=2.5)
                         l7_ok = False
                         lat = 0
-                        if ack and ack[1] == 0x00:
+                        if ack and len(ack) >= 2 and ack[1] == 0x00:
                             lat = int((time.perf_counter() - start) * 1000)
                             l7_ok = await check_l7(r3, w3)
 
@@ -1057,6 +1199,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     flush_stop = asyncio.Event()
     resume_cfg = load_resume_config()
     resume_enabled = bool(resume_cfg.get("enabled", True))
+    feed_cfg = load_feed_turbo_config()
+    accel_trigger_ratio = float(
+        feed_cfg.get("accel_trigger_ratio", FEED_ACCEL_TRIGGER_RATIO)
+    )
+    final_rush_ratio = float(feed_cfg.get("final_rush_ratio", FEED_FINAL_RUSH_RATIO))
+    accel_factor = float(feed_cfg.get("accel_factor", FEED_ACCEL_FACTOR))
     session_key = f"{mode}|{work_mode}|{','.join(str(p) for p in ports)}"
     done_targets = set()
     if resume_enabled:
@@ -1067,6 +1215,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 done_targets = {str(x) for x in raw_done if str(x).strip()}
     state["resume_enabled"] = resume_enabled
     state["resume_restored"] = len(done_targets)
+    state["feed_accel_trigger_ratio"] = accel_trigger_ratio
+    state["feed_final_rush_ratio"] = final_rush_ratio
+    state["feed_accel_factor"] = accel_factor
     tg_cfg = load_telegram_config()
     tg_enabled = (
         tg_cfg.get("enabled")
@@ -1077,6 +1228,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     tg_condition_mode = int(tg_cfg.get("condition_mode", 2))
     tg_verified_threshold = int(tg_cfg.get("verified_threshold", 5))
     last_interval_push_ts = 0.0
+    last_quick_persist_ts = 0.0
     special_or_sent = False
     notify_tasks = set()
 
@@ -1226,7 +1378,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     tokens.append(l.split(":", 1) if ":" in l else ["admin", l])
 
     async def worker():
-        nonlocal special_or_sent
+        nonlocal special_or_sent, last_quick_persist_ts
         while True:
             ip = await q.get()
             if ip is None:
@@ -1276,11 +1428,25 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         if s_r:
                             await handle_found_results([s_r])
                             break
+                quick_state_snapshot = None
+                quick_cp_snapshot = None
                 async with state_lock:
                     state["done"] += 1
                     state["current"] = f"Completed -> {ip}"
                     if resume_enabled:
                         done_targets.add(ip)
+                    now = now_ts()
+                    if now - last_quick_persist_ts >= 1.0:
+                        last_quick_persist_ts = now
+                        quick_state_snapshot = dict(state)
+                        if resume_enabled:
+                            quick_cp_snapshot = {
+                                "session_key": session_key,
+                                "updated_at": now,
+                                "done_targets": sorted(done_targets),
+                                "done": state.get("done", 0),
+                                "total": state.get("total", 0),
+                            }
                     need_special_or_push = (
                         tg_enabled
                         and tg_condition_mode == 4
@@ -1304,11 +1470,19 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     else:
                         special_snapshot = None
                         special_recent = []
+                if quick_state_snapshot is not None:
+                    save_state(STATE_FILE, quick_state_snapshot)
+                if quick_cp_snapshot is not None:
+                    save_state(CHECKPOINT_FILE, quick_cp_snapshot)
                 if special_snapshot is not None:
                     schedule_telegram(
                         "SAIA 触发推送: 验真数量达到阈值\n"
                         + build_interval_message(special_snapshot, special_recent)
                     )
+            except Exception:
+                log_exception(f"worker crash ip={ip}")
+                async with state_lock:
+                    state["current"] = f"Worker error -> {ip}"
             finally:
                 if active_started:
                     async with state_lock:
@@ -1327,6 +1501,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         return
 
     seen_targets = set()
+    all_targets = []
     skipped_by_resume = 0
     try:
         for node_file in node_files:
@@ -1345,23 +1520,42 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             if target in seen_targets:
                                 continue
                             seen_targets.add(target)
-                            async with state_lock:
-                                state["total"] += 1
-                            if resume_enabled and target in done_targets:
-                                skipped_by_resume += 1
-                                async with state_lock:
-                                    state["done"] += 1
-                                    state["current"] = f"Resume skip -> {target}"
-                                continue
-                            async with state_lock:
-                                state["current"] = f"Feeding target -> {target}"
-                            await q.put(target)
-                            await asyncio.sleep(feed_int)
+                            all_targets.append(target)
     except OSError:
         pass
 
-    if skipped_by_resume > 0:
-        log_event(f"Resume restored {skipped_by_resume} completed targets")
+    async with state_lock:
+        state["total"] = len(all_targets)
+
+    if resume_enabled:
+        pending_targets = []
+        for target in all_targets:
+            if target in done_targets:
+                skipped_by_resume += 1
+            else:
+                pending_targets.append(target)
+        if skipped_by_resume > 0:
+            async with state_lock:
+                state["done"] += skipped_by_resume
+                state["current"] = f"Resume skip -> {skipped_by_resume} targets"
+            log_event(f"Resume restored {skipped_by_resume} completed targets")
+    else:
+        pending_targets = all_targets
+
+    pending_total = len(pending_targets)
+    for idx, target in enumerate(pending_targets, start=1):
+        async with state_lock:
+            state["current"] = f"Feeding target -> {target}"
+        await q.put(target)
+        if feed_int > 0:
+            remaining_ratio = (pending_total - idx) / max(1, pending_total)
+            current_feed_int = feed_int
+            if remaining_ratio <= final_rush_ratio:
+                current_feed_int = 0.0
+            elif remaining_ratio <= accel_trigger_ratio:
+                current_feed_int = feed_int * accel_factor
+            if current_feed_int > 0:
+                await asyncio.sleep(current_feed_int)
 
     for _ in range(threads):
         await q.put(None)
@@ -1435,6 +1629,12 @@ def main_console():
         s5_verified = int(s.get("s5_verified", 0))
         done = int(s.get("done", 0))
         total = int(s.get("total", 0))
+        main_bar = render_progress_bar(done, total, width=24)
+        progress_ratio = (done / total) if total > 0 else 0.0
+        progress_pct = progress_ratio * 100.0
+        ip_bar_width = 24
+        ip_bar_fill = int(ip_bar_width * max(0.0, min(1.0, progress_ratio)))
+        ip_bar = "#" * ip_bar_fill + "-" * (ip_bar_width - ip_bar_fill)
         active_workers = int(s.get("active_workers", 0))
         socket_limit = int(s.get("socket_limit", 0))
         socket_in_use = int(s.get("socket_in_use", 0))
@@ -1489,6 +1689,12 @@ def main_console():
         )
         print(
             panel_line(
+                f"{C_W}当前IP:{C_CYAN}{done}{C_W}/{total} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]"
+            )
+        )
+        print(panel_line(f"{C_W}进度条:{main_bar}"))
+        print(
+            panel_line(
                 f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}"
             )
         )
@@ -1505,9 +1711,10 @@ def main_console():
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
         print(f" 1) 启动审计  5) 停止审计  9) 退出系统")
         print(f" 2) 监控面板  6) 启动守护")
-        print(f" 3) 查看结果  10) Telegram推送")
+        print(f" 3) X-UI审计/验真  10) Telegram推送")
         print(f" 4) 查看日志  8) 停止守护")
-        print(f" 7) 断点续连  11) 查看(发现)")
+        print(f" 7) 断点续连  11) S5审计/验真")
+        print(f" 12) 进料加速策略")
 
         c = timed_input(
             f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}",
@@ -1542,8 +1749,20 @@ def main_console():
                 print("端口无效")
                 time.sleep(1)
                 continue
+            fi = prompt_float(
+                "喂IP间隔秒 (默认0.02, 0=最快): ", default=0.02, min_value=0.0
+            )
             subprocess.Popen(
-                [sys.executable, __file__, "run", str(m), str(wm), str(th), ps, "0.02"],
+                [
+                    sys.executable,
+                    __file__,
+                    "run",
+                    str(m),
+                    str(wm),
+                    str(th),
+                    ps,
+                    str(fi),
+                ],
                 start_new_session=True,
             )
             print(f"{C_SUCC}>>> 核心已启动!{C_W}")
@@ -1596,10 +1815,58 @@ def main_console():
                 pass
 
         elif c == "3":
-            output = read_last_lines(REPORT_FILE, lines=50)
-            print(f"\n{C_CYAN}>>> 最近 50 条结果{C_W}\n")
-            print(output if output else f"{C_DIM}暂无数据{C_W}")
-            input(f"\n{C_BLUE}按回车返回...{C_W}")
+            try:
+                while True:
+                    st = load_state(STATE_FILE)
+                    xui_audited, xui_verified, _, _ = collect_report_sections(limit=120)
+                    recent = st.get("recent", [])
+                    if not isinstance(recent, list):
+                        recent = []
+                    recent = [str(x) for x in recent]
+                    xui_recent_audited = [
+                        l
+                        for l in recent
+                        if (
+                            "[资产-面板存活]" in l
+                            or "Asset[X-UI]" in l
+                            or "面板在线" in l
+                        )
+                    ]
+                    xui_recent_verified = [
+                        l
+                        for l in recent
+                        if (
+                            "[高危-后台沦陷]" in l
+                            or ("Asset[X-UI]" in l and "验真成功" in l)
+                        )
+                    ]
+                    xui_audited = merge_recent_lines(
+                        xui_audited, xui_recent_audited, 120
+                    )
+                    xui_verified = merge_recent_lines(
+                        xui_verified, xui_recent_verified, 120
+                    )
+                    os.system("cls" if os.name == "nt" else "clear")
+                    print(f"\n{C_CYAN}>>> X-UI 审计实时面板{C_W}")
+                    print(
+                        f"已审计: {C_CYAN}{st.get('xui_found', 0)}{C_W} | 已验真: {C_WARN}{st.get('xui_verified', 0)}{C_W} | 刷新: 1s"
+                    )
+                    print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
+                    print(
+                        "\n".join(xui_audited[-40:])
+                        if xui_audited
+                        else f"{C_DIM}暂无X-UI审计数据{C_W}"
+                    )
+                    print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
+                    print(
+                        "\n".join(xui_verified[-40:])
+                        if xui_verified
+                        else f"{C_DIM}暂无X-UI验真数据{C_W}"
+                    )
+                    print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
+                    time.sleep(1.0)
+            except KeyboardInterrupt:
+                pass
 
         elif c == "4":
             output = read_last_lines(LOG_FILE, lines=50)
@@ -1667,6 +1934,44 @@ def main_console():
                 clear_checkpoint()
                 print(f"{C_SUCC}>>> 断点记录已清空{C_W}")
             time.sleep(1)
+
+        elif c == "12":
+            fcfg = load_feed_turbo_config()
+            print(f"\n{C_CYAN}>>> 进料加速策略{C_W}")
+            print("规则: 剩余比例<=触发阈值时加速, 剩余比例<=冲刺阈值时不再等待")
+            print(
+                f"当前: 触发阈值={fcfg.get('accel_trigger_ratio', 0.5):.2f} | 冲刺阈值={fcfg.get('final_rush_ratio', 0.1):.2f} | 加速系数={fcfg.get('accel_factor', 0.5):.2f}"
+            )
+            print("留空表示保持当前值")
+
+            raw_trigger = input("触发阈值(0-1, 默认0.50): ").strip()
+            raw_final = input("冲刺阈值(0-1, 默认0.10): ").strip()
+            raw_factor = input("加速系数(0-1, 默认0.50, 越小越快): ").strip()
+
+            if raw_trigger:
+                try:
+                    fcfg["accel_trigger_ratio"] = max(0.0, min(1.0, float(raw_trigger)))
+                except ValueError:
+                    print("触发阈值无效，保持原值")
+            if raw_final:
+                try:
+                    fcfg["final_rush_ratio"] = max(0.0, min(1.0, float(raw_final)))
+                except ValueError:
+                    print("冲刺阈值无效，保持原值")
+            if raw_factor:
+                try:
+                    fcfg["accel_factor"] = max(0.0, min(1.0, float(raw_factor)))
+                except ValueError:
+                    print("加速系数无效，保持原值")
+
+            if fcfg.get("final_rush_ratio", 0.1) > fcfg.get("accel_trigger_ratio", 0.5):
+                fcfg["final_rush_ratio"] = fcfg.get("accel_trigger_ratio", 0.5)
+                print("冲刺阈值不能大于触发阈值，已自动调整")
+
+            save_feed_turbo_config(fcfg)
+            print(f"{C_SUCC}>>> 进料加速策略已保存{C_W}")
+            print(f"{C_DIM}提示: 新策略会在下一次启动审计时生效{C_W}")
+            time.sleep(1.5)
 
         elif c == "10":
             cfg = load_telegram_config()
@@ -1736,36 +2041,59 @@ def main_console():
         elif c == "9":
             break
         elif c == "11":
-            found_output = read_last_lines(
-                REPORT_FILE,
-                lines=200,
-                filter_keywords=[
-                    "存活",
-                    "连通",
-                    "加密节点",
-                    "发现成功",
-                    "Asset[X-UI]",
-                    "Node[S5",
-                ],
-            )
-            s5_output = read_last_lines(
-                REPORT_FILE,
-                lines=200,
-                filter_keywords=["Node[S5", "S5-OPEN", "S5-AUTH", "连通", "加密节点"],
-            )
-            verified_output = read_last_lines(
-                REPORT_FILE,
-                lines=200,
-                filter_keywords=["沦陷", "真穿透", "验证成功", "认证通过"],
-            )
-
-            print(f"\n{C_CYAN}>>> 发现资产列表 (存活/连通){C_W}\n")
-            print(found_output if found_output else f"{C_DIM}暂无发现数据{C_W}")
-            print(f"\n{C_CYAN}>>> S5 资产列表{C_W}\n")
-            print(s5_output if s5_output else f"{C_DIM}暂无S5资产数据{C_W}")
-            print(f"\n{C_CYAN}>>> 验真结果 (真实可用){C_W}\n")
-            print(verified_output if verified_output else f"{C_DIM}暂无验真数据{C_W}")
-            input(f"\n{C_BLUE}按回车返回...{C_W}")
+            try:
+                while True:
+                    st = load_state(STATE_FILE)
+                    _, _, s5_audited, s5_verified = collect_report_sections(limit=120)
+                    recent = st.get("recent", [])
+                    if not isinstance(recent, list):
+                        recent = []
+                    recent = [str(x) for x in recent]
+                    s5_recent_audited = [
+                        l
+                        for l in recent
+                        if (
+                            "[节点-可连通]" in l
+                            or "[资产-加密节点]" in l
+                            or "Node[S5" in l
+                            or "S5-OPEN" in l
+                            or "S5-AUTH" in l
+                            or "需认证" in l
+                        )
+                    ]
+                    s5_recent_verified = [
+                        l
+                        for l in recent
+                        if (
+                            "[优质-真穿透]" in l
+                            or ("Node[S5" in l and ("验证成功" in l or "认证通过" in l))
+                        )
+                    ]
+                    s5_audited = merge_recent_lines(s5_audited, s5_recent_audited, 120)
+                    s5_verified = merge_recent_lines(
+                        s5_verified, s5_recent_verified, 120
+                    )
+                    os.system("cls" if os.name == "nt" else "clear")
+                    print(f"\n{C_CYAN}>>> S5 审计实时面板{C_W}")
+                    print(
+                        f"已审计: {C_CYAN}{st.get('s5_found', 0)}{C_W} | 已验真: {C_SUCC}{st.get('s5_verified', 0)}{C_W} | 刷新: 1s"
+                    )
+                    print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
+                    print(
+                        "\n".join(s5_audited[-40:])
+                        if s5_audited
+                        else f"{C_DIM}暂无S5审计数据{C_W}"
+                    )
+                    print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
+                    print(
+                        "\n".join(s5_verified[-40:])
+                        if s5_verified
+                        else f"{C_DIM}暂无S5验真数据{C_W}"
+                    )
+                    print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
+                    time.sleep(1.0)
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == "__main__":
@@ -1783,7 +2111,13 @@ if __name__ == "__main__":
             or feed_int < 0
         ):
             raise SystemExit("Err")
-        asyncio.run(internal_audit_process(mode, work_mode, threads, ports, feed_int))
+        try:
+            asyncio.run(
+                internal_audit_process(mode, work_mode, threads, ports, feed_int)
+            )
+        except Exception:
+            log_exception("fatal crash in run mode")
+            raise
     elif len(sys.argv) > 1 and sys.argv[1] == "guardian":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 6:
@@ -1809,5 +2143,8 @@ if __name__ == "__main__":
             )
         except ValueError:
             raise SystemExit("Err")
+        except Exception:
+            log_exception("fatal crash in guardian mode")
+            raise
     else:
         main_console()
