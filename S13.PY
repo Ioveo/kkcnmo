@@ -209,6 +209,7 @@ def default_telegram_config():
         "chat_id": "",
         "interval_minutes": 0,
         "condition_mode": 2,
+        "verified_threshold": 5,
     }
 
 
@@ -228,7 +229,11 @@ def load_telegram_config():
         c_mode = int(cfg.get("condition_mode", 2))
     except (TypeError, ValueError):
         c_mode = 2
-    cfg["condition_mode"] = c_mode if c_mode in (0, 1, 2, 3) else 2
+    cfg["condition_mode"] = c_mode if c_mode in (0, 1, 2, 3, 4) else 2
+    try:
+        cfg["verified_threshold"] = max(1, int(cfg.get("verified_threshold", 5)))
+    except (TypeError, ValueError):
+        cfg["verified_threshold"] = 5
     return cfg
 
 
@@ -242,6 +247,7 @@ def telegram_condition_label(mode):
         1: "发现即推送",
         2: "仅验真推送",
         3: "发现+验真推送",
+        4: "完成或验真>=阈值(单次)",
     }.get(mode, str(mode))
 
 
@@ -817,7 +823,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     )
     tg_interval_sec = max(0, int(tg_cfg.get("interval_minutes", 0))) * 60
     tg_condition_mode = int(tg_cfg.get("condition_mode", 2))
+    tg_verified_threshold = int(tg_cfg.get("verified_threshold", 5))
     last_interval_push_ts = 0.0
+    special_or_sent = False
     notify_tasks = set()
 
     q = asyncio.Queue(maxsize=max(threads * 4, 4096))
@@ -860,6 +868,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             return is_verified
         if tg_condition_mode == 3:
             return is_found or is_verified
+        if tg_condition_mode == 4:
+            return False
         return False
 
     def build_interval_message(snapshot, recent_lines):
@@ -938,6 +948,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     tokens.append(l.split(":", 1) if ":" in l else ["admin", l])
 
     async def worker():
+        nonlocal special_or_sent
         while True:
             ip = await q.get()
             if ip is None:
@@ -987,6 +998,34 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 async with state_lock:
                     state["done"] += 1
                     state["current"] = f"Completed -> {ip}"
+                    need_special_or_push = (
+                        tg_enabled
+                        and tg_condition_mode == 4
+                        and not special_or_sent
+                        and (
+                            state.get("xui_verified", 0) + state.get("s5_verified", 0)
+                            >= tg_verified_threshold
+                        )
+                    )
+                    if need_special_or_push:
+                        special_or_sent = True
+                        special_snapshot = {
+                            "done": state.get("done", 0),
+                            "total": state.get("total", 0),
+                            "xui_found": state.get("xui_found", 0),
+                            "xui_verified": state.get("xui_verified", 0),
+                            "s5_found": state.get("s5_found", 0),
+                            "s5_verified": state.get("s5_verified", 0),
+                        }
+                        special_recent = list(state.get("recent", []))[-5:]
+                    else:
+                        special_snapshot = None
+                        special_recent = []
+                if special_snapshot is not None:
+                    schedule_telegram(
+                        "SAIA 触发推送: 验真数量达到阈值\n"
+                        + build_interval_message(special_snapshot, special_recent)
+                    )
             finally:
                 q.task_done()
 
@@ -1026,19 +1065,23 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state["status"] = "completed"
     state["current"] = "Completed"
     if tg_enabled:
-        schedule_telegram(
-            build_interval_message(
-                {
-                    "done": state.get("done", 0),
-                    "total": state.get("total", 0),
-                    "xui_found": state.get("xui_found", 0),
-                    "xui_verified": state.get("xui_verified", 0),
-                    "s5_found": state.get("s5_found", 0),
-                    "s5_verified": state.get("s5_verified", 0),
-                },
-                list(state.get("recent", []))[-5:],
-            )
-        )
+        final_snapshot = {
+            "done": state.get("done", 0),
+            "total": state.get("total", 0),
+            "xui_found": state.get("xui_found", 0),
+            "xui_verified": state.get("xui_verified", 0),
+            "s5_found": state.get("s5_found", 0),
+            "s5_verified": state.get("s5_verified", 0),
+        }
+        final_recent = list(state.get("recent", []))[-5:]
+        if tg_condition_mode == 4:
+            if not special_or_sent:
+                schedule_telegram(
+                    "SAIA 触发推送: 全部 IP 审计完成\n"
+                    + build_interval_message(final_snapshot, final_recent)
+                )
+        else:
+            schedule_telegram(build_interval_message(final_snapshot, final_recent))
     flush_stop.set()
     await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
     if notify_tasks:
@@ -1229,7 +1272,7 @@ def main_console():
             cfg = load_telegram_config()
             print(f"\n{C_CYAN}>>> Telegram 推送配置{C_W}")
             print(
-                f"当前状态: {'启用' if cfg.get('enabled') else '关闭'} | 条件: {telegram_condition_label(cfg.get('condition_mode', 2))} | 定时: {cfg.get('interval_minutes', 0)} 分钟"
+                f"当前状态: {'启用' if cfg.get('enabled') else '关闭'} | 条件: {telegram_condition_label(cfg.get('condition_mode', 2))} | 定时: {cfg.get('interval_minutes', 0)} 分钟 | 验真阈值: {cfg.get('verified_threshold', 5)}"
             )
             print("留空表示保持当前值")
             token = input("Bot Token: ").strip()
@@ -1237,8 +1280,9 @@ def main_console():
             en_raw = input("启用推送? (y/n, 默认保持): ").strip().lower()
             interval_raw = input("定时推送间隔分钟 (0=关闭, 默认保持): ").strip()
             cond_raw = input(
-                "条件推送 (0关闭/1发现即推/2仅验真/3发现+验真, 默认保持): "
+                "条件推送 (0关闭/1发现即推/2仅验真/3发现+验真/4完成或验真>=阈值(单次), 默认保持): "
             ).strip()
+            th_raw = input("验真阈值 (默认5, 仅模式4生效, 默认保持): ").strip()
             test_raw = input("保存后发送测试消息? (y/n): ").strip().lower()
 
             if token:
@@ -1255,12 +1299,17 @@ def main_console():
             if cond_raw:
                 try:
                     cond_mode = int(cond_raw)
-                    if cond_mode in (0, 1, 2, 3):
+                    if cond_mode in (0, 1, 2, 3, 4):
                         cfg["condition_mode"] = cond_mode
                     else:
                         print("条件模式无效，保持原值")
                 except ValueError:
                     print("条件输入无效，保持原值")
+            if th_raw:
+                try:
+                    cfg["verified_threshold"] = max(1, int(th_raw))
+                except ValueError:
+                    print("阈值输入无效，保持原值")
 
             save_telegram_config(cfg)
             print(f"{C_SUCC}>>> Telegram 配置已保存{C_W}")
