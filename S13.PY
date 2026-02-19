@@ -12,10 +12,11 @@ import ctypes
 import ssl
 import re
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 天才猫
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +29,7 @@ FALLBACK_NODE_FILE_UPPER = os.path.join(BASE_DIR, "IP.TXT")
 TOKEN_FILE = os.path.join(BASE_DIR, "tokens.list")
 FALLBACK_TOKEN_FILE = os.path.join(BASE_DIR, "pass.txt")
 GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
+TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 LOG_BACKUPS = 5
@@ -41,7 +43,7 @@ ADAPT_STEP_UP = 50
 ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
-EXPOSE_SECRET_IN_REPORT = True
+EXPOSE_SECRET_IN_REPORT = False
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
@@ -198,6 +200,78 @@ def mask_secret(secret):
     if EXPOSE_SECRET_IN_REPORT:
         return secret
     return "***"
+
+
+def default_telegram_config():
+    return {
+        "enabled": False,
+        "bot_token": "",
+        "chat_id": "",
+        "interval_minutes": 0,
+        "condition_mode": 2,
+    }
+
+
+def load_telegram_config():
+    cfg = default_telegram_config()
+    data = load_state(TELEGRAM_CFG_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+    cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["bot_token"] = str(cfg.get("bot_token", "")).strip()
+    cfg["chat_id"] = str(cfg.get("chat_id", "")).strip()
+    try:
+        cfg["interval_minutes"] = max(0, int(cfg.get("interval_minutes", 0)))
+    except (TypeError, ValueError):
+        cfg["interval_minutes"] = 0
+    try:
+        c_mode = int(cfg.get("condition_mode", 2))
+    except (TypeError, ValueError):
+        c_mode = 2
+    cfg["condition_mode"] = c_mode if c_mode in (0, 1, 2, 3) else 2
+    return cfg
+
+
+def save_telegram_config(cfg):
+    save_state(TELEGRAM_CFG_FILE, cfg)
+
+
+def telegram_condition_label(mode):
+    return {
+        0: "关闭条件推送",
+        1: "发现即推送",
+        2: "仅验真推送",
+        3: "发现+验真推送",
+    }.get(mode, str(mode))
+
+
+def send_telegram_message(bot_token, chat_id, text):
+    if not bot_token or not chat_id:
+        return False, "missing token/chat_id"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = urllib.parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "text": text[:3800],
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return '"ok":true' in body, body[:200]
+    except Exception as exc:
+        return False, str(exc)
+
+
+async def send_telegram_message_async(bot_token, chat_id, text):
+    return await asyncio.to_thread(send_telegram_message, bot_token, chat_id, text)
 
 
 def get_geo_info(ip):
@@ -735,6 +809,16 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     save_state(STATE_FILE, state)
     state_lock = asyncio.Lock()
     flush_stop = asyncio.Event()
+    tg_cfg = load_telegram_config()
+    tg_enabled = (
+        tg_cfg.get("enabled")
+        and bool(tg_cfg.get("bot_token"))
+        and bool(tg_cfg.get("chat_id"))
+    )
+    tg_interval_sec = max(0, int(tg_cfg.get("interval_minutes", 0))) * 60
+    tg_condition_mode = int(tg_cfg.get("condition_mode", 2))
+    last_interval_push_ts = 0.0
+    notify_tasks = set()
 
     q = asyncio.Queue(maxsize=max(threads * 4, 4096))
     adaptive_min = min(ADAPT_MIN_CONCURRENCY, max(10, threads))
@@ -745,11 +829,78 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state["socket_in_use"] = 0
     state["free_mb"] = get_available_memory_mb()
 
+    async def push_telegram(text):
+        if not tg_enabled:
+            return
+        ok, detail = await send_telegram_message_async(
+            tg_cfg["bot_token"], tg_cfg["chat_id"], text
+        )
+        if not ok:
+            log_event(f"Telegram send failed: {detail}")
+
+    def schedule_telegram(text):
+        if not tg_enabled:
+            return
+        task = asyncio.create_task(push_telegram(text))
+        notify_tasks.add(task)
+        task.add_done_callback(lambda t: notify_tasks.discard(t))
+
+    def should_push_condition(line):
+        is_verified = ("[高危-后台沦陷]" in line) or ("[优质-真穿透]" in line)
+        is_found = (
+            ("[资产-面板存活]" in line)
+            or ("[节点-可连通]" in line)
+            or ("[资产-加密节点]" in line)
+        )
+        if tg_condition_mode == 0:
+            return False
+        if tg_condition_mode == 1:
+            return is_found or is_verified
+        if tg_condition_mode == 2:
+            return is_verified
+        if tg_condition_mode == 3:
+            return is_found or is_verified
+        return False
+
+    def build_interval_message(snapshot, recent_lines):
+        return (
+            f"SAIA 审计定时推送\n"
+            f"模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n"
+            f"进度: {snapshot.get('done', 0)}/{snapshot.get('total', 0)}\n"
+            f"XUI: 发现 {snapshot.get('xui_found', 0)} / 验真 {snapshot.get('xui_verified', 0)}\n"
+            f"S5: 连通 {snapshot.get('s5_found', 0)} / 验真 {snapshot.get('s5_verified', 0)}\n"
+            f"最近:\n" + ("\n".join(recent_lines) if recent_lines else "-")
+        )
+
     async def flush_state_loop():
+        nonlocal last_interval_push_ts
         while not flush_stop.is_set():
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
+            now = now_ts()
+            should_send_interval = False
+            snapshot = None
+            recent_lines = []
             async with state_lock:
                 save_state(STATE_FILE, state)
+                if (
+                    tg_enabled
+                    and tg_interval_sec > 0
+                    and now - last_interval_push_ts >= tg_interval_sec
+                    and state.get("total", 0) > 0
+                ):
+                    should_send_interval = True
+                    snapshot = {
+                        "done": state.get("done", 0),
+                        "total": state.get("total", 0),
+                        "xui_found": state.get("xui_found", 0),
+                        "xui_verified": state.get("xui_verified", 0),
+                        "s5_found": state.get("s5_found", 0),
+                        "s5_verified": state.get("s5_verified", 0),
+                    }
+                    recent_lines = list(state.get("recent", []))[-5:]
+            if should_send_interval:
+                last_interval_push_ts = now
+                schedule_telegram(build_interval_message(snapshot, recent_lines))
 
     async def adaptive_conn_loop():
         current_limit = socket_limit
@@ -825,6 +976,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                                 MAX_REPORT_BYTES,
                                 REPORT_BACKUPS,
                             )
+                        if tg_enabled and tg_condition_mode in (1, 2, 3):
+                            matched = [r for r in found_res if should_push_condition(r)]
+                            if matched:
+                                schedule_telegram(
+                                    "SAIA 条件命中推送\n" + "\n".join(matched)
+                                )
                     if x_done and s_done:
                         break
                 async with state_lock:
@@ -868,8 +1025,24 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     await asyncio.gather(*workers)
     state["status"] = "completed"
     state["current"] = "Completed"
+    if tg_enabled:
+        schedule_telegram(
+            build_interval_message(
+                {
+                    "done": state.get("done", 0),
+                    "total": state.get("total", 0),
+                    "xui_found": state.get("xui_found", 0),
+                    "xui_verified": state.get("xui_verified", 0),
+                    "s5_found": state.get("s5_found", 0),
+                    "s5_verified": state.get("s5_verified", 0),
+                },
+                list(state.get("recent", []))[-5:],
+            )
+        )
     flush_stop.set()
     await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
+    if notify_tasks:
+        await asyncio.gather(*list(notify_tasks), return_exceptions=True)
     save_state(STATE_FILE, state)
 
 
@@ -912,8 +1085,8 @@ def main_console():
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
         print(f" 1) 启动审计  5) 停止审计  9) 退出系统")
         print(f" 2) 监控面板  6) 启动守护")
-        print(f" 3) 查看结果  8) 停止守护")
-        print(f" 4) 查看日志")
+        print(f" 3) 查看结果  10) Telegram推送")
+        print(f" 4) 查看日志  8) 停止守护")
 
         c = input(
             f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}"
@@ -1050,6 +1223,57 @@ def main_console():
                 start_new_session=True,
             )
             print(f"{C_SUCC}>>> 守护进程已启动{C_W}")
+            time.sleep(1)
+
+        elif c == "10":
+            cfg = load_telegram_config()
+            print(f"\n{C_CYAN}>>> Telegram 推送配置{C_W}")
+            print(
+                f"当前状态: {'启用' if cfg.get('enabled') else '关闭'} | 条件: {telegram_condition_label(cfg.get('condition_mode', 2))} | 定时: {cfg.get('interval_minutes', 0)} 分钟"
+            )
+            print("留空表示保持当前值")
+            token = input("Bot Token: ").strip()
+            chat_id = input("Chat ID: ").strip()
+            en_raw = input("启用推送? (y/n, 默认保持): ").strip().lower()
+            interval_raw = input("定时推送间隔分钟 (0=关闭, 默认保持): ").strip()
+            cond_raw = input(
+                "条件推送 (0关闭/1发现即推/2仅验真/3发现+验真, 默认保持): "
+            ).strip()
+            test_raw = input("保存后发送测试消息? (y/n): ").strip().lower()
+
+            if token:
+                cfg["bot_token"] = token
+            if chat_id:
+                cfg["chat_id"] = chat_id
+            if en_raw in ("y", "n"):
+                cfg["enabled"] = en_raw == "y"
+            if interval_raw:
+                try:
+                    cfg["interval_minutes"] = max(0, int(interval_raw))
+                except ValueError:
+                    print("间隔输入无效，保持原值")
+            if cond_raw:
+                try:
+                    cond_mode = int(cond_raw)
+                    if cond_mode in (0, 1, 2, 3):
+                        cfg["condition_mode"] = cond_mode
+                    else:
+                        print("条件模式无效，保持原值")
+                except ValueError:
+                    print("条件输入无效，保持原值")
+
+            save_telegram_config(cfg)
+            print(f"{C_SUCC}>>> Telegram 配置已保存{C_W}")
+            if test_raw == "y":
+                ok, detail = send_telegram_message(
+                    cfg.get("bot_token", ""),
+                    cfg.get("chat_id", ""),
+                    "SAIA 测试消息: Telegram 推送配置已生效。",
+                )
+                if ok:
+                    print(f"{C_SUCC}>>> 测试消息发送成功{C_W}")
+                else:
+                    print(f"{C_WARN}>>> 测试消息发送失败: {detail}{C_W}")
             time.sleep(1)
 
         elif c == "8":
