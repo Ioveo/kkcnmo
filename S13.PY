@@ -32,6 +32,15 @@ MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 LOG_BACKUPS = 5
 REPORT_BACKUPS = 3
+STATE_FLUSH_INTERVAL = 1.0
+MAX_SOCKET_CONCURRENCY = 600
+ADAPT_CHECK_INTERVAL = 2.0
+ADAPT_MIN_CONCURRENCY = 100
+ADAPT_MAX_CONCURRENCY = 1000
+ADAPT_STEP_UP = 50
+ADAPT_STEP_DOWN = 100
+ADAPT_LOW_MB = 800.0
+ADAPT_HIGH_MB = 2048.0
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
@@ -161,6 +170,17 @@ def resolve_node_file():
     if os.path.exists(FALLBACK_NODE_FILE_UPPER):
         return FALLBACK_NODE_FILE_UPPER
     return None
+
+
+def resolve_node_files():
+    files = []
+    if os.path.exists(NODE_FILE):
+        files.append(NODE_FILE)
+    if os.path.exists(FALLBACK_NODE_FILE):
+        files.append(FALLBACK_NODE_FILE)
+    if os.path.exists(FALLBACK_NODE_FILE_UPPER):
+        files.append(FALLBACK_NODE_FILE_UPPER)
+    return files
 
 
 def resolve_token_file():
@@ -364,6 +384,41 @@ def get_available_memory_mb():
     return 1024.0  # Default safe fallback
 
 
+class AdaptiveLimiter:
+    def __init__(self, capacity):
+        self._capacity = max(1, int(capacity))
+        self._in_use = 0
+        self._cv = asyncio.Condition()
+
+    async def acquire(self):
+        async with self._cv:
+            while self._in_use >= self._capacity:
+                await self._cv.wait()
+            self._in_use += 1
+
+    async def release(self):
+        async with self._cv:
+            if self._in_use > 0:
+                self._in_use -= 1
+            self._cv.notify_all()
+
+    async def set_capacity(self, capacity):
+        async with self._cv:
+            self._capacity = max(1, int(capacity))
+            self._cv.notify_all()
+
+    async def snapshot(self):
+        async with self._cv:
+            return self._capacity, self._in_use
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.release()
+
+
 def run_guardian(
     mode,
     work_mode,
@@ -431,7 +486,7 @@ def run_guardian(
 # ==================== 审计核心 (v23.0 智能追踪与深层穿透) ====================
 
 
-async def audit_xui(ip, port, tokens, state, state_lock, work_mode):
+async def audit_xui(ip, port, tokens, state, state_lock, work_mode, conn_limiter):
     """X-UI 智能跳转与多维凭证验证"""
 
     async def fetch_page(path, use_ssl=False, method="GET", payload=""):
@@ -441,10 +496,11 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode):
             if ssl_ctx is not None:
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port, ssl=ssl_ctx if use_ssl else None),
-                timeout=3.5,
-            )
+            async with conn_limiter:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port, ssl=ssl_ctx if use_ssl else None),
+                    timeout=3.5,
+                )
 
             ua = random.choice(USER_AGENTS)
             if method == "GET":
@@ -467,7 +523,16 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode):
         low = data.lower()
         if b"x-ui" in low or b"3x-ui" in low or b"/xui" in low:
             return True
-        if b"/login" in low and (b"username" in low or b"password" in low):
+        if b"/login" in low and (
+            b"username" in low or b"password" in low or b"signin" in low
+        ):
+            return True
+        if b"/assets/ant-design-vue/antd.min.css" in low and (
+            b"/assets/css/custom.min.css" in low
+            or b"/assets/element-ui/theme-chalk/display.css" in low
+        ):
+            return True
+        if b"-welcome</title>" in low and b"/assets/js/" in low:
             return True
         return False
 
@@ -546,7 +611,7 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode):
     return None
 
 
-async def audit_socks5(ip, port, tokens, state, state_lock, work_mode):
+async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limiter):
     """SOCKS5 七层(L7)真穿透验证"""
 
     async def check_l7(reader, writer):
@@ -570,9 +635,10 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode):
 
     writer = None
     try:
-        r, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=3.0
-        )
+        async with conn_limiter:
+            r, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=3.0
+            )
         writer.write(b"\x05\x02\x00\x02")
         await writer.drain()
         res = await asyncio.wait_for(r.read(2), timeout=2.0)
@@ -589,9 +655,10 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode):
                 return f"[节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn} | 发现开放代理"
 
             await close_writer(writer)
-            r2, w2 = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout=2.5
-            )
+            async with conn_limiter:
+                r2, w2 = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=2.5
+                )
             try:
                 start = time.perf_counter()
                 w2.write(
@@ -625,9 +692,10 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode):
             for u, p in tokens:
                 w3 = None
                 try:
-                    r3, w3 = await asyncio.wait_for(
-                        asyncio.open_connection(ip, port), timeout=2.0
-                    )
+                    async with conn_limiter:
+                        r3, w3 = await asyncio.wait_for(
+                            asyncio.open_connection(ip, port), timeout=2.0
+                        )
                     w3.write(b"\x05\x01\x02")
                     await w3.drain()
                     await r3.read(2)
@@ -689,6 +757,52 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     }
     save_state(STATE_FILE, state)
     state_lock = asyncio.Lock()
+    flush_stop = asyncio.Event()
+
+    adaptive_min = min(ADAPT_MIN_CONCURRENCY, max(10, threads))
+    adaptive_max = max(adaptive_min, min(threads, ADAPT_MAX_CONCURRENCY))
+    socket_limit = max(50, min(MAX_SOCKET_CONCURRENCY, adaptive_max))
+    conn_limiter = AdaptiveLimiter(socket_limit)
+    state["socket_limit"] = socket_limit
+    state["socket_in_use"] = 0
+    state["free_mb"] = get_available_memory_mb()
+
+    async def flush_state_loop():
+        while not flush_stop.is_set():
+            await asyncio.sleep(STATE_FLUSH_INTERVAL)
+            async with state_lock:
+                save_state(STATE_FILE, state)
+
+    async def adaptive_conn_loop():
+        current_limit = socket_limit
+        while not flush_stop.is_set():
+            await asyncio.sleep(ADAPT_CHECK_INTERVAL)
+            mem_mb = get_available_memory_mb()
+            queue_size = q.qsize()
+            next_limit = current_limit
+
+            if mem_mb is not None and mem_mb < ADAPT_LOW_MB:
+                next_limit = max(adaptive_min, current_limit - ADAPT_STEP_DOWN)
+            elif mem_mb is not None and mem_mb > ADAPT_HIGH_MB and queue_size > 0:
+                next_limit = min(adaptive_max, current_limit + ADAPT_STEP_UP)
+
+            if next_limit != current_limit:
+                await conn_limiter.set_capacity(next_limit)
+                current_limit = next_limit
+                log_event(
+                    f"Adaptive concurrency adjusted to {current_limit} "
+                    f"(free_mb={mem_mb:.0f} queue={queue_size})"
+                    if mem_mb is not None
+                    else f"Adaptive concurrency adjusted to {current_limit} (queue={queue_size})"
+                )
+
+            cap, in_use = await conn_limiter.snapshot()
+            async with state_lock:
+                state["socket_limit"] = cap
+                state["socket_in_use"] = in_use
+                state["free_mb"] = round(mem_mb, 1) if mem_mb is not None else None
+
+    flusher = asyncio.create_task(flush_state_loop())
 
     tokens = []
     token_file = resolve_token_file()
@@ -699,7 +813,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 if l:
                     tokens.append(l.split(":", 1) if ":" in l else ["admin", l])
 
-    q = asyncio.Queue(maxsize=threads * 2)
+    q = asyncio.Queue(maxsize=max(threads * 4, 4096))
+    adaptive_task = asyncio.create_task(adaptive_conn_loop())
 
     async def worker():
         while True:
@@ -716,14 +831,14 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     found_res = []
                     if mode in (1, 3) and not x_done:
                         x_r = await audit_xui(
-                            ip, p, tokens, state, state_lock, work_mode
+                            ip, p, tokens, state, state_lock, work_mode, conn_limiter
                         )
                         if x_r:
                             found_res.append(x_r)
                             x_done = True
                     if mode in (2, 3) and not s_done:
                         s_r = await audit_socks5(
-                            ip, p, tokens, state, state_lock, work_mode
+                            ip, p, tokens, state, state_lock, work_mode, conn_limiter
                         )
                         if s_r:
                             found_res.append(s_r)
@@ -733,41 +848,48 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         async with state_lock:
                             for r in found_res:
                                 state["recent"] = (state["recent"] + [r])[-6:]
-                                append_rotating(
-                                    REPORT_FILE,
-                                    r + "\n",
-                                    MAX_REPORT_BYTES,
-                                    REPORT_BACKUPS,
-                                )
+                        for r in found_res:
+                            append_rotating(
+                                REPORT_FILE,
+                                r + "\n",
+                                MAX_REPORT_BYTES,
+                                REPORT_BACKUPS,
+                            )
                     if x_done and s_done:
                         break
                 async with state_lock:
                     state["done"] += 1
                     state["current"] = f"Completed -> {ip}"
-                    save_state(STATE_FILE, state)
             finally:
                 q.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(threads)]
-    node_file = resolve_node_file()
-    if not node_file:
+    node_files = resolve_node_files()
+    if not node_files:
         state["status"] = "completed"
+        flush_stop.set()
+        await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
         save_state(STATE_FILE, state)
         return
 
+    seen_targets = set()
     try:
-        with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                for target in line.split():
-                    async with state_lock:
-                        state["current"] = f"Feeding target -> {target}"
-                    await q.put(target)
-                    async with state_lock:
-                        state["total"] += 1
-                    await asyncio.sleep(feed_int)
+        for node_file in node_files:
+            with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for target in line.split():
+                        if target in seen_targets:
+                            continue
+                        seen_targets.add(target)
+                        async with state_lock:
+                            state["current"] = f"Feeding target -> {target}"
+                        await q.put(target)
+                        async with state_lock:
+                            state["total"] += 1
+                        await asyncio.sleep(feed_int)
     except OSError:
         pass
 
@@ -776,6 +898,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     await asyncio.gather(*workers)
     state["status"] = "completed"
     state["current"] = "Completed"
+    flush_stop.set()
+    await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
     save_state(STATE_FILE, state)
 
 
@@ -801,7 +925,7 @@ def main_console():
             m = prompt_int("模式 (1-3): ", default=3, min_value=1, max_value=3)
             print("子模式: 1.探索 | 2.探索+验真 | 3.只留极品(真穿透/沦陷)")
             wm = prompt_int("子模式 (1-3): ", default=2, min_value=1, max_value=3)
-            th = prompt_int("线程 (默认20): ", default=20, min_value=1, max_value=500)
+            th = prompt_int("线程 (默认20): ", default=20, min_value=1, max_value=1000)
             fi = prompt_float("IP 调用间隔秒 (默认0.02): ", default=0.02, min_value=0.0)
             default_ports = (
                 DEFAULT_XUI_PORTS
@@ -875,7 +999,7 @@ def main_console():
             m = prompt_int("守护模式 (1-3): ", default=3, min_value=1, max_value=3)
             wm = prompt_int("守护子模式 (1-3): ", default=2, min_value=1, max_value=3)
             th = prompt_int(
-                "守护线程 (默认10): ", default=10, min_value=1, max_value=500
+                "守护线程 (默认10): ", default=10, min_value=1, max_value=1000
             )
             fi = prompt_float("调用间隔秒 (默认0.05): ", default=0.05, min_value=0.0)
             ci = prompt_float("检查间隔秒 (默认20): ", default=20.0, min_value=1.0)
