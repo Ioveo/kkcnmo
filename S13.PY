@@ -1479,7 +1479,7 @@ def main_console():
             f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
         print(
-            panel_line(f"{C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}旗舰穿透版")
+            panel_line(f"{C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫")
         )
         print(
             f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
@@ -1818,3 +1818,4 @@ if __name__ == "__main__":
             raise SystemExit("Err")
     else:
         main_console()
+
