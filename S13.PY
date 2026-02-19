@@ -178,7 +178,7 @@ def read_last_lines(path, lines=50, filter_keywords=None):
         return ""
 
 
-def collect_report_sections(limit=120):
+def collect_report_sections(limit=None):
     xui_audited, xui_verified = [], []
     s5_audited, s5_verified = [], []
     if not os.path.exists(REPORT_FILE):
@@ -237,22 +237,40 @@ def collect_report_sections(limit=120):
     except OSError:
         pass
 
-    return (
-        xui_audited[-limit:],
-        xui_verified[-limit:],
-        s5_audited[-limit:],
-        s5_verified[-limit:],
-    )
+    if isinstance(limit, int) and limit > 0:
+        return (
+            xui_audited[-limit:],
+            xui_verified[-limit:],
+            s5_audited[-limit:],
+            s5_verified[-limit:],
+        )
+    return xui_audited, xui_verified, s5_audited, s5_verified
 
 
-def merge_recent_lines(base_lines, recent_lines, limit=120):
+def merge_recent_lines(base_lines, recent_lines, limit=None):
     out = list(base_lines)
     seen = set(out)
     for line in recent_lines:
         if line and line not in seen:
             out.append(line)
             seen.add(line)
-    return out[-limit:]
+    if isinstance(limit, int) and limit > 0:
+        return out[-limit:]
+    return out
+
+
+def clear_report_history():
+    try:
+        open(REPORT_FILE, "w", encoding="utf-8").close()
+    except OSError:
+        pass
+    for i in range(1, REPORT_BACKUPS + 1):
+        p = f"{REPORT_FILE}.{i}"
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
 
 
 def latest_ip_port(lines):
@@ -1743,6 +1761,7 @@ def main_console():
         print(f" 4) 查看日志  8) 停止守护")
         print(f" 7) 断点续连  11) S5审计/验真")
         print(f" 12) 进料加速策略")
+        print(f" 13) 清空审计结果")
 
         try:
             c = timed_input(
@@ -1852,7 +1871,9 @@ def main_console():
                 last_sig = None
                 while True:
                     st = load_state(STATE_FILE)
-                    xui_audited, xui_verified, _, _ = collect_report_sections(limit=120)
+                    xui_audited, xui_verified, _, _ = collect_report_sections(
+                        limit=None
+                    )
                     recent = st.get("recent", [])
                     if not isinstance(recent, list):
                         recent = []
@@ -1875,10 +1896,10 @@ def main_console():
                         )
                     ]
                     xui_audited = merge_recent_lines(
-                        xui_audited, xui_recent_audited, 120
+                        xui_audited, xui_recent_audited, None
                     )
                     xui_verified = merge_recent_lines(
-                        xui_verified, xui_recent_verified, 120
+                        xui_verified, xui_recent_verified, None
                     )
                     sig = (
                         int(st.get("xui_found", 0)),
@@ -1900,13 +1921,13 @@ def main_console():
                         )
                         print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
                         print(
-                            "\n".join(xui_audited[-120:])
+                            "\n".join(xui_audited)
                             if xui_audited
                             else f"{C_DIM}暂无X-UI审计数据{C_W}"
                         )
                         print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
                         print(
-                            "\n".join(xui_verified[-120:])
+                            "\n".join(xui_verified)
                             if xui_verified
                             else f"{C_DIM}暂无X-UI验真数据{C_W}"
                         )
@@ -2092,7 +2113,7 @@ def main_console():
                 last_sig = None
                 while True:
                     st = load_state(STATE_FILE)
-                    _, _, s5_audited, s5_verified = collect_report_sections(limit=120)
+                    _, _, s5_audited, s5_verified = collect_report_sections(limit=None)
                     recent = st.get("recent", [])
                     if not isinstance(recent, list):
                         recent = []
@@ -2128,9 +2149,9 @@ def main_console():
                             )
                         )
                     ]
-                    s5_audited = merge_recent_lines(s5_audited, s5_recent_audited, 120)
+                    s5_audited = merge_recent_lines(s5_audited, s5_recent_audited, None)
                     s5_verified = merge_recent_lines(
-                        s5_verified, s5_recent_verified, 120
+                        s5_verified, s5_recent_verified, None
                     )
                     sig = (
                         int(st.get("s5_found", 0)),
@@ -2152,13 +2173,13 @@ def main_console():
                         )
                         print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
                         print(
-                            "\n".join(s5_audited[-120:])
+                            "\n".join(s5_audited)
                             if s5_audited
                             else f"{C_DIM}暂无S5审计数据{C_W}"
                         )
                         print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
                         print(
-                            "\n".join(s5_verified[-120:])
+                            "\n".join(s5_verified)
                             if s5_verified
                             else f"{C_DIM}暂无S5验真数据{C_W}"
                         )
@@ -2166,6 +2187,15 @@ def main_console():
                     time.sleep(0.5)
             except KeyboardInterrupt:
                 pass
+
+        elif c == "13":
+            sure = input("确认清空审计结果历史? (y/n): ").strip().lower()
+            if sure == "y":
+                clear_report_history()
+                print(f"{C_SUCC}>>> 审计结果历史已清空{C_W}")
+            else:
+                print(f"{C_DIM}已取消{C_W}")
+            time.sleep(1)
 
 
 if __name__ == "__main__":
