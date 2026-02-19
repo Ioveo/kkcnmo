@@ -10,6 +10,7 @@ import signal
 import subprocess
 import ctypes
 import ssl
+import re
 from datetime import datetime
 
 # ============================================================
@@ -128,6 +129,101 @@ def pick_one_verified_result():
         return random.choice(verified_rows)
     except OSError:
         return None
+
+
+def mode_label(mode):
+    return {1: "XUI专项", 2: "S5专项", 3: "深度全能"}.get(mode, str(mode))
+
+
+def work_mode_label(work_mode):
+    return {1: "探索", 2: "探索+验真", 3: "只验真"}.get(work_mode, str(work_mode))
+
+
+def parse_report_targets(lines):
+    targets = []
+    seen = set()
+    xui_pat = re.compile(r"Asset\[X-UI\]:\s*([^:\s]+):(\d+)")
+    s5_open_pat = re.compile(r"Node\[S5-Open\]:\s*([^:\s]+):(\d+)")
+    s5_auth_pat = re.compile(r"Node\[S5-Auth\]:\s*(?:[^@\s]+@)?([^:\s]+):(\d+)")
+
+    for line in lines:
+        text = line.strip()
+        if not text:
+            continue
+        m = xui_pat.search(text)
+        kind = "xui"
+        if not m:
+            m = s5_open_pat.search(text)
+            kind = "s5"
+        if not m:
+            m = s5_auth_pat.search(text)
+            kind = "s5"
+        if not m:
+            continue
+        ip, port = m.group(1), int(m.group(2))
+        key = (kind, ip, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(key)
+    return targets
+
+
+async def verify_s5_service(ip, port):
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=3.0)
+        writer.write(b"\x05\x02\x00\x02")
+        await writer.drain()
+        res = await asyncio.wait_for(reader.read(2), timeout=2.0)
+        if not res or res[0] != 5:
+            return False, "SOCKS5握手失败"
+        if res[1] == 0x00:
+            return True, "SOCKS5开放代理仍可用"
+        if res[1] == 0x02:
+            return True, "SOCKS5认证代理仍可用"
+        return True, f"SOCKS5返回认证方法: 0x{res[1]:02x}"
+    except (asyncio.TimeoutError, OSError, ValueError):
+        return False, "连接超时或不可达"
+    finally:
+        await close_writer(writer)
+
+
+async def reverify_discovered_results():
+    if not os.path.exists(REPORT_FILE):
+        return "未找到报告文件，无法复验。"
+
+    with open(REPORT_FILE, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    targets = parse_report_targets(lines)
+    if not targets:
+        return "报告中没有可复验目标。"
+
+    passed, failed = 0, 0
+    logs = []
+    for kind, ip, port in targets:
+        if kind == "xui":
+            tmp_state = {"xui_found": 0, "xui_verified": 0}
+            ok = bool(await audit_xui(ip, port, tmp_state, 3))
+            msg = "XUI复验成功" if ok else "XUI复验失败"
+        else:
+            ok, detail = await verify_s5_service(ip, port)
+            msg = detail if ok else f"S5复验失败: {detail}"
+
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        logs.append(f"[{kind.upper()}] {ip}:{port} -> {msg}")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    append_rotating(
+        os.path.join(BASE_DIR, "reverify.log"),
+        f"[{stamp}] total={len(targets)} passed={passed} failed={failed}\n" + "\n".join(logs) + "\n\n",
+        512 * 1024,
+        3,
+    )
+    return f"复验完成: 总计{len(targets)}，成功{passed}，失败{failed}（详情见 reverify.log）"
 
 
 def render_progress_bar(done, total, width=28):
@@ -265,13 +361,14 @@ def get_available_memory_mb():
     return None
 
 
-def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20, min_free_mb=256.0):
+def run_guardian(mode, work_mode, threads, ports_str, feed_int=0.05, check_interval=20, min_free_mb=256.0):
     save_state(
         GUARDIAN_STATE_FILE,
         {
             "pid": os.getpid(),
             "status": "running",
             "mode": mode,
+            "work_mode": work_mode,
             "threads": threads,
             "ports": ports_str,
             "updated_at": now_ts(),
@@ -281,7 +378,7 @@ def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20, min
         },
     )
     log_event(
-        f"Guardian started mode={mode} threads={threads} ports={ports_str} "
+        f"Guardian started mode={mode} work_mode={work_mode} threads={threads} ports={ports_str} "
         f"feed_int={feed_int} check_interval={check_interval}s min_free_mb={min_free_mb}"
     )
     while True:
@@ -295,6 +392,7 @@ def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20, min
                         __file__,
                         "run",
                         str(mode),
+                        str(work_mode),
                         str(threads),
                         ports_str,
                         str(feed_int),
@@ -316,7 +414,7 @@ def run_guardian(mode, threads, ports_str, feed_int=0.05, check_interval=20, min
 
 # ==================== 审计核心 (协议双向验证) ====================
 
-async def audit_xui(ip, port, state):
+async def audit_xui(ip, port, state, work_mode):
     """X-UI 探测与验证"""
     async def fetch_page(path, use_ssl=False):
         writer = None
@@ -370,13 +468,21 @@ async def audit_xui(ip, port, state):
     for path, use_ssl in probes:
         data = await fetch_page(path, use_ssl=use_ssl)
         if match_xui(data):
-            state["xui_found"] += 1
-            state["xui_verified"] += 1
+            if work_mode in (1, 2):
+                state["xui_found"] += 1
+            if work_mode in (2, 3):
+                state["xui_verified"] += 1
             proto = "https" if use_ssl else "http"
-            return f"Asset[X-UI]: {ip}:{port} | 状态: 验证成功-面板在线 | 协议: {proto} | 路径: {path}"
+            if work_mode == 1:
+                status = "发现成功-面板疑似在线"
+            elif work_mode == 2:
+                status = "探索+验真成功-面板在线"
+            else:
+                status = "仅验真成功-面板在线"
+            return f"Asset[X-UI]: {ip}:{port} | 状态: {status} | 协议: {proto} | 路径: {path}"
     return None
 
-async def audit_socks5(ip, port, tokens, state):
+async def audit_socks5(ip, port, tokens, state, work_mode):
     """SOCKS5 探测、验证与爆破"""
     writer = None
     try:
@@ -388,7 +494,10 @@ async def audit_socks5(ip, port, tokens, state):
 
         # 无需认证的节点
         if res[1] == 0x00:
-            state["s5_found"] += 1
+            if work_mode in (1, 2):
+                state["s5_found"] += 1
+            if work_mode == 1:
+                return f"Node[S5-Open]: {ip}:{port} | 状态: 发现成功-开放代理"
             await close_writer(writer)
             r2, w2 = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=2.5)
             try:
@@ -399,12 +508,16 @@ async def audit_socks5(ip, port, tokens, state):
                 if ack and ack[1] == 0x00:
                     lat = int((time.perf_counter() - start) * 1000)
                     state["s5_verified"] += 1
-                    return f"Node[S5-Open]: {ip}:{port} | 验证成功-RTT:{lat}ms"
+                    label = "探索+验真成功" if work_mode == 2 else "仅验真成功"
+                    return f"Node[S5-Open]: {ip}:{port} | {label}-RTT:{lat}ms"
             finally: await close_writer(w2)
 
         # 需要认证的节点 (执行爆破)
         if res[1] == 0x02 and tokens:
-            state["s5_found"] += 1
+            if work_mode in (1, 2):
+                state["s5_found"] += 1
+            if work_mode == 1:
+                return f"Node[S5-Auth]: {ip}:{port} | 状态: 发现成功-需认证"
             await close_writer(writer)
             for u, p in tokens:
                 w3 = None
@@ -417,7 +530,8 @@ async def audit_socks5(ip, port, tokens, state):
                     auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
                     if auth and auth[1] == 0x00:
                         state["s5_verified"] += 1
-                        return f"Node[S5-Auth]: {u}@{ip}:{port} | 验证成功-认证通过"
+                        label = "探索+验真成功" if work_mode == 2 else "仅验真成功"
+                        return f"Node[S5-Auth]: {u}@{ip}:{port} | {label}-认证通过"
                 except (asyncio.TimeoutError, OSError, ValueError):
                     continue
                 finally:
@@ -430,15 +544,18 @@ async def audit_socks5(ip, port, tokens, state):
 
 # ==================== 后台调度 (双排数据采集) ====================
 
-async def internal_audit_process(mode, threads, ports, feed_int):
+async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state = {
         "status": "running", "pid": os.getpid(), 
         "total": 0, "done": 0, 
         "xui_found": 0, "xui_verified": 0, "s5_found": 0, "s5_verified": 0,
+        "work_mode": work_mode,
         "recent": [], "started_at": now_ts(), "current": "Initializing..."
     }
     save_state(STATE_FILE, state)
-    log_event(f"Audit started mode={mode} threads={threads} ports={len(ports)}")
+    log_event(
+        f"Audit started mode={mode} work_mode={work_mode} threads={threads} ports={len(ports)}"
+    )
     
     tokens = []
     token_file = resolve_token_file()
@@ -461,17 +578,23 @@ async def internal_audit_process(mode, threads, ports, feed_int):
                 break
             try:
                 state["current"] = f"Auditing -> {ip}"
+                x_done = (mode == 2)
+                s_done = (mode == 1)
                 for p in ports:
                     found_res = []
                     # 模式 1/3：独立验证 X-UI
-                    if mode in (1, 3):
-                        x_r = await audit_xui(ip, p, state)
-                        if x_r: found_res.append(x_r)
+                    if mode in (1, 3) and not x_done:
+                        x_r = await audit_xui(ip, p, state, work_mode)
+                        if x_r:
+                            found_res.append(x_r)
+                            x_done = True
 
                     # 模式 2/3：独立验证 SOCKS5
-                    if mode in (2, 3):
-                        s_r = await audit_socks5(ip, p, tokens, state)
-                        if s_r: found_res.append(s_r)
+                    if mode in (2, 3) and not s_done:
+                        s_r = await audit_socks5(ip, p, tokens, state, work_mode)
+                        if s_r:
+                            found_res.append(s_r)
+                            s_done = True
                     
                     if found_res:
                         for r in found_res:
@@ -482,10 +605,11 @@ async def internal_audit_process(mode, threads, ports, feed_int):
                                 MAX_REPORT_BYTES,
                                 REPORT_BACKUPS,
                             )
+                    if x_done and s_done:
                         break
                 state["done"] += 1
                 state["current"] = f"Completed -> {ip}"
-                if state["done"] % 10 == 0: save_state(STATE_FILE, state)
+                save_state(STATE_FILE, state)
             finally:
                 q.task_done()
 
@@ -531,6 +655,8 @@ def main_console():
         if c == "1":
             print("\n1.XUI专项 | 2.S5专项 | 3.深度全能审计")
             m = prompt_int("模式 (1-3): ", default=3, min_value=1, max_value=3)
+            print("子模式: 1.探索 | 2.探索+验真 | 3.只验真")
+            wm = prompt_int("子模式 (1-3): ", default=2, min_value=1, max_value=3)
             th = prompt_int("线程 (默认20): ", default=20, min_value=1, max_value=500)
             fi = prompt_float("IP 调用间隔秒 (默认0.02): ", default=0.02, min_value=0.0)
             default_ports = (
@@ -541,8 +667,11 @@ def main_console():
                 print("端口格式无效。")
                 time.sleep(1)
                 continue
-            subprocess.Popen([sys.executable, __file__, "run", str(m), str(th), ps, str(fi)], start_new_session=True)
-            print("审计已提交后台运行。")
+            subprocess.Popen(
+                [sys.executable, __file__, "run", str(m), str(wm), str(th), ps, str(fi)],
+                start_new_session=True,
+            )
+            print(f"审计已提交后台运行。模式: {mode_label(m)} | 子模式: {work_mode_label(wm)}")
             time.sleep(1)
         elif c == "2":
             try:
@@ -552,10 +681,10 @@ def main_console():
                     bar = render_progress_bar(done, total)
                     os.system("cls" if os.name == "nt" else "clear")
                     print(f"{C_BLUE}SAIA v20.0 | 双排监控{C_W}")
+                    print(f"工作状态: {st.get('current', '-')} | 子模式: {work_mode_label(st.get('work_mode', 2))}")
                     print(f"{C_PROC}[第一排 X-UI]{C_W} 发现面板: {st.get('xui_found', 0)} | 验证成功: {st.get('xui_verified', 0)}")
                     print(f"{C_SUCC}[第二排 SOCKS5]{C_W} 发现节点: {st.get('s5_found', 0)} | 验真成功: {st.get('s5_verified', 0)}")
                     print(f"{C_Y}[第三排 工作状态]{C_W} 进度: {bar} ({done}/{total}) | 状态: {st.get('status','-')}")
-                    print(f"当前任务: {st.get('current', '-')}")
                     print("\nCtrl+C 返回菜单")
                     time.sleep(1)
             except KeyboardInterrupt:
@@ -580,6 +709,8 @@ def main_console():
             time.sleep(1)
         elif c == "6":
             m = prompt_int("守护模式 (1-3): ", default=3, min_value=1, max_value=3)
+            print("守护子模式: 1.探索 | 2.探索+验真 | 3.只验真")
+            wm = prompt_int("守护子模式 (1-3): ", default=2, min_value=1, max_value=3)
             th = prompt_int("守护线程 (默认10): ", default=10, min_value=1, max_value=500)
             fi = prompt_float("守护启动时 IP 调用间隔秒 (默认0.05): ", default=0.05, min_value=0.0)
             ci = prompt_float("守护检查间隔秒 (默认20): ", default=20.0, min_value=1.0)
@@ -598,6 +729,7 @@ def main_console():
                     __file__,
                     "guardian",
                     str(m),
+                    str(wm),
                     str(th),
                     ps,
                     str(fi),
@@ -606,22 +738,12 @@ def main_console():
                 ],
                 start_new_session=True,
             )
-            print("守护已启动。")
+            print(f"守护已启动。模式: {mode_label(m)} | 子模式: {work_mode_label(wm)}")
             time.sleep(1)
         elif c == "7":
-            picked = pick_one_verified_result()
-            if not picked:
-                print("没有可提取的已验证结果。")
-            else:
-                print(f"抽取结果: {picked}")
-                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                append_rotating(
-                    os.path.join(BASE_DIR, "verified_pick.txt"),
-                    f"[{stamp}] {picked}\n",
-                    512 * 1024,
-                    3,
-                )
-                print("已写入 verified_pick.txt")
+            print("正在一键复验已发现目标，请稍候...")
+            result = asyncio.run(reverify_discovered_results())
+            print(result)
             input("\n按回车返回...")
         elif c == "8":
             gpid = load_state(GUARDIAN_STATE_FILE).get("pid")
@@ -637,27 +759,30 @@ def main_console():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "run":
-        if len(sys.argv) < 6:
-            raise SystemExit("参数不足: run <mode> <threads> <ports> <feed_int>")
+        if len(sys.argv) < 7:
+            raise SystemExit("参数不足: run <mode> <work_mode> <threads> <ports> <feed_int>")
         mode = int(sys.argv[2])
-        threads = int(sys.argv[3])
-        ports = parse_ports(sys.argv[4])
-        feed_int = float(sys.argv[5])
+        work_mode = int(sys.argv[3])
+        threads = int(sys.argv[4])
+        ports = parse_ports(sys.argv[5])
+        feed_int = float(sys.argv[6])
         if mode not in (1, 2, 3):
             raise SystemExit("mode 仅支持 1/2/3")
+        if work_mode not in (1, 2, 3):
+            raise SystemExit("work_mode 仅支持 1/2/3")
         if threads < 1:
             raise SystemExit("threads 必须大于 0")
         if not ports:
             raise SystemExit("端口参数无效")
         if feed_int < 0:
             raise SystemExit("feed_int 不能小于 0")
-        asyncio.run(internal_audit_process(mode, threads, ports, feed_int))
+        asyncio.run(internal_audit_process(mode, work_mode, threads, ports, feed_int))
     elif len(sys.argv) > 1 and sys.argv[1] == "guardian":
-        if len(sys.argv) < 5:
-            raise SystemExit("参数不足: guardian <mode> <threads> <ports> [feed_int] [check_interval] [min_free_mb]")
-        feed_int = float(sys.argv[5]) if len(sys.argv) > 5 else 0.05
-        check_interval = float(sys.argv[6]) if len(sys.argv) > 6 else 20.0
-        min_free_mb = float(sys.argv[7]) if len(sys.argv) > 7 else 256.0
+        if len(sys.argv) < 6:
+            raise SystemExit("参数不足: guardian <mode> <work_mode> <threads> <ports> [feed_int] [check_interval] [min_free_mb]")
+        feed_int = float(sys.argv[6]) if len(sys.argv) > 6 else 0.05
+        check_interval = float(sys.argv[7]) if len(sys.argv) > 7 else 20.0
+        min_free_mb = float(sys.argv[8]) if len(sys.argv) > 8 else 256.0
         if feed_int < 0:
             raise SystemExit("feed_int 不能小于 0")
         if check_interval < 1:
@@ -667,7 +792,8 @@ if __name__ == "__main__":
         run_guardian(
             int(sys.argv[2]),
             int(sys.argv[3]),
-            sys.argv[4],
+            int(sys.argv[4]),
+            sys.argv[5],
             feed_int=feed_int,
             check_interval=check_interval,
             min_free_mb=min_free_mb,
