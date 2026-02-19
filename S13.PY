@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA)  - 天才猫
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1236,7 +1236,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     save_state(STATE_FILE, state)
 
 
-# ==================== 管理界面 (天才猫) ====================
+# ==================== 管理界面  ====================
 
 
 def main_console():
@@ -1254,6 +1254,8 @@ def main_console():
         g_status = (
             f"{C_SUCC}ON{C_BLUE}" if is_alive(g.get("pid")) else f"{C_DIM}OFF{C_BLUE}"
         )
+        xui_audited = int(s.get("xui_found", 0))
+        s5_audited = int(s.get("s5_found", 0))
 
         # 极光面板头部
         print(
@@ -1266,7 +1268,7 @@ def main_console():
             f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
         print(
-            f"{C_BLUE}┃ {C_W}审计引擎: {p_status:<17} {C_BLUE}┃ {C_W}自启守护: {g_status:<17} {C_BLUE}┃{C_W}"
+            f"{C_BLUE}┃ {C_W}审计引擎:{p_status} {C_BLUE}| {C_W}自启守护:{g_status} {C_BLUE}| {C_W}XUI已审计:{C_CYAN}{xui_audited}{C_W} {C_BLUE}| {C_W}S5已审计:{C_CYAN}{s5_audited}{C_BLUE} ┃{C_W}"
         )
         print(
             f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
