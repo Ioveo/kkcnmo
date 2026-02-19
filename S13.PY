@@ -174,7 +174,7 @@ def read_last_lines(path, lines=50, filter_keywords=None):
                     l for l in all_lines if any(k in l for k in filter_keywords)
                 ]
             return "".join(all_lines[-lines:])
-    except:
+    except OSError:
         return ""
 
 
@@ -295,6 +295,32 @@ def to_ip_port_user_pass(line):
     return f"{ip_port}:{user}:{pwd}"
 
 
+def extract_country_asn(line):
+    country = "-"
+    asn = "-"
+    parts = [p.strip() for p in line.split("|")]
+    for i, p in enumerate(parts):
+        up = p.upper()
+        if re.fullmatch(r"[A-Z]{2}", up):
+            country = up
+            if i + 1 < len(parts):
+                nxt = parts[i + 1].strip().upper()
+                if nxt.startswith("AS"):
+                    asn = nxt
+            break
+    if asn == "-":
+        m_asn = re.search(r"\bAS\d+\b", line, re.IGNORECASE)
+        if m_asn:
+            asn = m_asn.group(0).upper()
+    return country, asn
+
+
+def format_result_line(line, service_tag):
+    base = to_ip_port_user_pass(line)
+    country, asn = extract_country_asn(line)
+    return f"{base} #{service_tag}|{country}，{asn}"
+
+
 def clear_report_history():
     try:
         open(REPORT_FILE, "w", encoding="utf-8").close()
@@ -381,7 +407,7 @@ def default_telegram_config():
 
 
 def default_resume_config():
-    return {"enabled": True}
+    return {"enabled": True, "skip_scanned": False}
 
 
 def load_resume_config():
@@ -390,11 +416,27 @@ def load_resume_config():
     if isinstance(data, dict):
         cfg.update(data)
     cfg["enabled"] = bool(cfg.get("enabled", True))
+    cfg["skip_scanned"] = bool(cfg.get("skip_scanned", False))
     return cfg
 
 
 def save_resume_config(cfg):
     save_state(RESUME_CFG_FILE, cfg)
+
+
+def collect_reported_ips():
+    ips = set()
+    if not os.path.exists(REPORT_FILE):
+        return ips
+    try:
+        with open(REPORT_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
+                if m:
+                    ips.add(m.group(1))
+    except OSError:
+        pass
+    return ips
 
 
 def default_feed_turbo_config():
@@ -831,7 +873,7 @@ def get_available_memory_mb():
             return (
                 (page_size * (free_pages + inactive_pages + cache_pages)) / 1024 / 1024
             )
-        except:
+        except (OSError, ValueError, subprocess.CalledProcessError):
             return None
 
     meminfo = "/proc/meminfo"
@@ -1309,6 +1351,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     flush_stop = asyncio.Event()
     resume_cfg = load_resume_config()
     resume_enabled = bool(resume_cfg.get("enabled", True))
+    skip_scanned_enabled = bool(resume_cfg.get("skip_scanned", False))
     feed_cfg = load_feed_turbo_config()
     accel_trigger_ratio = float(
         feed_cfg.get("accel_trigger_ratio", FEED_ACCEL_TRIGGER_RATIO)
@@ -1324,6 +1367,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             if isinstance(raw_done, list):
                 done_targets = {str(x) for x in raw_done if str(x).strip()}
     state["resume_enabled"] = resume_enabled
+    state["skip_scanned_enabled"] = skip_scanned_enabled
     state["resume_restored"] = len(done_targets)
     state["feed_accel_trigger_ratio"] = accel_trigger_ratio
     state["feed_final_rush_ratio"] = final_rush_ratio
@@ -1379,19 +1423,10 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
     def should_push_condition(line):
         is_verified = ("[高危-后台沦陷]" in line) or ("[优质-真穿透]" in line)
-        is_found = (
-            ("[资产-面板存活]" in line)
-            or ("[节点-可连通]" in line)
-            or ("[资产-加密节点]" in line)
-        )
         if tg_condition_mode == 0:
             return False
-        if tg_condition_mode == 1:
-            return is_found or is_verified
-        if tg_condition_mode == 2:
+        if tg_condition_mode in (1, 2, 3):
             return is_verified
-        if tg_condition_mode == 3:
-            return is_found or is_verified
         if tg_condition_mode == 4:
             return False
         return False
@@ -1637,20 +1672,28 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     async with state_lock:
         state["total"] = len(all_targets)
 
-    if resume_enabled:
-        pending_targets = []
-        for target in all_targets:
-            if target in done_targets:
-                skipped_by_resume += 1
-            else:
-                pending_targets.append(target)
+    skipped_by_history = 0
+    scanned_ips = collect_reported_ips() if skip_scanned_enabled else set()
+    pending_targets = []
+    for target in all_targets:
+        if resume_enabled and target in done_targets:
+            skipped_by_resume += 1
+            continue
+        if skip_scanned_enabled and target in scanned_ips:
+            skipped_by_history += 1
+            continue
+        pending_targets.append(target)
+
+    if skipped_by_resume > 0 or skipped_by_history > 0:
+        async with state_lock:
+            state["done"] += skipped_by_resume + skipped_by_history
+            state["current"] = (
+                f"Skip -> resume:{skipped_by_resume} history:{skipped_by_history}"
+            )
         if skipped_by_resume > 0:
-            async with state_lock:
-                state["done"] += skipped_by_resume
-                state["current"] = f"Resume skip -> {skipped_by_resume} targets"
             log_event(f"Resume restored {skipped_by_resume} completed targets")
-    else:
-        pending_targets = all_targets
+        if skipped_by_history > 0:
+            log_event(f"History skipped {skipped_by_history} scanned targets")
 
     pending_total = len(pending_targets)
     async with state_lock:
@@ -1788,7 +1831,7 @@ def main_console():
         print(
             f"{panel_border}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
-        print(panel_line(f"SAIA MASTER CONSOLE v23.5 | 天才猫"))
+        print(panel_line(f"SAIA MASTER CONSOLE v23.5 | 旗舰穿透版"))
         print(
             f"{panel_border}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
@@ -1830,7 +1873,7 @@ def main_console():
         print(f" 4) 查看日志  8) 停止守护")
         print(f" 7) 断点续连  11) S5审计/验真")
         print(f" 12) 进料加速策略")
-        print(f" 13) 清空审计结果")
+        print(f" 13) 清空审计结果  14) 清空审计结果")
 
         try:
             c = timed_input(
@@ -1953,25 +1996,17 @@ def main_console():
                     xui_recent_verified = [
                         l for l in recent if classify_report_line(l)[1]
                     ]
-                    xui_audited = merge_recent_lines(
-                        xui_audited, xui_recent_audited, None
-                    )
-                    xui_verified = merge_recent_lines(
-                        xui_verified, xui_recent_verified, None
-                    )
+                    xui_audited = list(xui_audited) + list(xui_recent_audited)
+                    xui_verified = list(xui_verified) + list(xui_recent_verified)
                     recent_ip_lines = [
                         l
                         for l in recent
                         if re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", l)
                     ]
                     if int(st.get("xui_found", 0)) > 0 and not xui_audited:
-                        xui_audited = merge_recent_lines(
-                            xui_audited, recent_ip_lines, None
-                        )
+                        xui_audited = list(xui_audited) + list(recent_ip_lines)
                     if int(st.get("xui_verified", 0)) > 0 and not xui_verified:
-                        xui_verified = merge_recent_lines(
-                            xui_verified, recent_ip_lines, None
-                        )
+                        xui_verified = list(xui_verified) + list(recent_ip_lines)
                     sig = (
                         int(st.get("xui_found", 0)),
                         int(st.get("xui_verified", 0)),
@@ -1992,13 +2027,15 @@ def main_console():
                         )
                         print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
                         print(
-                            "\n".join(to_ip_port_user_pass(l) for l in xui_audited)
+                            "\n".join(format_result_line(l, "xui") for l in xui_audited)
                             if xui_audited
                             else f"{C_DIM}暂无X-UI审计数据{C_W}"
                         )
                         print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
                         print(
-                            "\n".join(to_ip_port_user_pass(l) for l in xui_verified)
+                            "\n".join(
+                                format_result_line(l, "xui") for l in xui_verified
+                            )
                             if xui_verified
                             else f"{C_DIM}暂无X-UI验真数据{C_W}"
                         )
@@ -2060,7 +2097,9 @@ def main_console():
             rcfg = load_resume_config()
             print(f"\n{C_CYAN}>>> 断点续连配置{C_W}")
             print(f"当前状态: {'启用' if rcfg.get('enabled', True) else '关闭'}")
-            print("1) 开启  2) 关闭  3) 清空断点")
+            print(f"已扫跳过: {'启用' if rcfg.get('skip_scanned', False) else '关闭'}")
+            print("1) 开启续连  2) 关闭续连  3) 清空断点")
+            print("4) 开启已扫跳过  5) 关闭已扫跳过")
             sel = input("请选择 (默认回车返回): ").strip()
             if sel == "1":
                 rcfg["enabled"] = True
@@ -2073,6 +2112,15 @@ def main_console():
             elif sel == "3":
                 clear_checkpoint()
                 print(f"{C_SUCC}>>> 断点记录已清空{C_W}")
+            elif sel == "4":
+                rcfg["skip_scanned"] = True
+                save_resume_config(rcfg)
+                print(f"{C_SUCC}>>> 已开启已扫跳过(按结果历史){C_W}")
+                print(f"{C_DIM}下一次启动审计生效{C_W}")
+            elif sel == "5":
+                rcfg["skip_scanned"] = False
+                save_resume_config(rcfg)
+                print(f"{C_WARN}>>> 已关闭已扫跳过{C_W}")
             time.sleep(1)
 
         elif c == "12":
@@ -2196,23 +2244,17 @@ def main_console():
                     s5_recent_verified = [
                         l for l in recent if classify_report_line(l)[3]
                     ]
-                    s5_audited = merge_recent_lines(s5_audited, s5_recent_audited, None)
-                    s5_verified = merge_recent_lines(
-                        s5_verified, s5_recent_verified, None
-                    )
+                    s5_audited = list(s5_audited) + list(s5_recent_audited)
+                    s5_verified = list(s5_verified) + list(s5_recent_verified)
                     recent_ip_lines = [
                         l
                         for l in recent
                         if re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", l)
                     ]
                     if int(st.get("s5_found", 0)) > 0 and not s5_audited:
-                        s5_audited = merge_recent_lines(
-                            s5_audited, recent_ip_lines, None
-                        )
+                        s5_audited = list(s5_audited) + list(recent_ip_lines)
                     if int(st.get("s5_verified", 0)) > 0 and not s5_verified:
-                        s5_verified = merge_recent_lines(
-                            s5_verified, recent_ip_lines, None
-                        )
+                        s5_verified = list(s5_verified) + list(recent_ip_lines)
                     sig = (
                         int(st.get("s5_found", 0)),
                         int(st.get("s5_verified", 0)),
@@ -2233,13 +2275,17 @@ def main_console():
                         )
                         print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
                         print(
-                            "\n".join(to_ip_port_user_pass(l) for l in s5_audited)
+                            "\n".join(
+                                format_result_line(l, "socks5") for l in s5_audited
+                            )
                             if s5_audited
                             else f"{C_DIM}暂无S5审计数据{C_W}"
                         )
                         print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
                         print(
-                            "\n".join(to_ip_port_user_pass(l) for l in s5_verified)
+                            "\n".join(
+                                format_result_line(l, "socks5") for l in s5_verified
+                            )
                             if s5_verified
                             else f"{C_DIM}暂无S5验真数据{C_W}"
                         )
@@ -2249,7 +2295,7 @@ def main_console():
             except KeyboardInterrupt:
                 pass
 
-        elif c == "13":
+        elif c in ("13", "14"):
             sure = input("确认清空审计结果历史? (y/n): ").strip().lower()
             if sure == "y":
                 clear_report_history()
