@@ -11,6 +11,7 @@ import subprocess
 import ctypes
 import ssl
 import re
+import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -1353,9 +1354,20 @@ def main_console():
     spin_idx = 0
     panel_inner = 74
 
+    def visible_width(text):
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        width = 0
+        for ch in clean:
+            if unicodedata.combining(ch):
+                continue
+            if unicodedata.east_asian_width(ch) in ("W", "F"):
+                width += 2
+            else:
+                width += 1
+        return width
+
     def panel_line(text):
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
-        pad = max(0, panel_inner - 1 - len(plain))
+        pad = max(0, panel_inner - 1 - visible_width(text))
         return f"{C_BLUE}┃ {text}{' ' * pad}{C_BLUE}┃{C_W}"
 
     while True:
@@ -1380,8 +1392,8 @@ def main_console():
         socket_limit = int(s.get("socket_limit", 0))
         socket_in_use = int(s.get("socket_in_use", 0))
         current = str(s.get("current", "-"))
-        if len(current) > 26:
-            current = current[:26] + "..."
+        if len(current) > 62:
+            current = current[:62] + "..."
         local_free_mb = get_available_memory_mb()
         local_total_mb = get_total_memory_mb()
         local_cpu = get_cpu_usage_percent()
@@ -1417,7 +1429,7 @@ def main_console():
             f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
         print(
-            panel_line(f"{C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫")
+            panel_line(f"{C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}旗舰穿透版")
         )
         print(
             f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
