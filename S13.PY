@@ -191,39 +191,8 @@ def collect_report_sections(limit=None):
                 if not line:
                     continue
 
-                is_xui_audited = (
-                    "[资产-面板存活]" in line
-                    or "Asset[X-UI]" in line
-                    or "面板在线" in line
-                )
-                is_xui_verified = "[高危-后台沦陷]" in line or (
-                    "Asset[X-UI]" in line and "验真成功" in line
-                )
-
-                is_s5_audited = (
-                    "[节点-可连通]" in line
-                    or "[资产-加密节点]" in line
-                    or "Node[S5" in line
-                    or "SOCKS5" in line.upper()
-                    or "S5" in line.upper()
-                    or "S5-OPEN" in line
-                    or "S5-AUTH" in line
-                    or "需认证" in line
-                )
-                is_s5_verified = (
-                    "[优质-真穿透]" in line
-                    or (
-                        "Node[S5" in line and ("验证成功" in line or "认证通过" in line)
-                    )
-                    or (
-                        ("S5" in line.upper() or "SOCKS5" in line.upper())
-                        and (
-                            "验证成功" in line
-                            or "认证通过" in line
-                            or "真穿透" in line
-                            or "RTT:" in line
-                        )
-                    )
+                is_xui_audited, is_xui_verified, is_s5_audited, is_s5_verified = (
+                    classify_report_line(line)
                 )
 
                 if is_xui_audited:
@@ -257,6 +226,73 @@ def merge_recent_lines(base_lines, recent_lines, limit=None):
     if isinstance(limit, int) and limit > 0:
         return out[-limit:]
     return out
+
+
+def classify_report_line(line):
+    low = line.lower()
+    is_xui_audited = (
+        "[资产-面板存活]" in line
+        or "asset[x-ui]" in low
+        or "x-ui" in low
+        or "xui" in low
+        or "面板" in line
+    )
+    is_xui_verified = "[高危-后台沦陷]" in line or (
+        is_xui_audited and ("验真成功" in line or "登录成功" in line)
+    )
+
+    is_s5_audited = (
+        "[节点-可连通]" in line
+        or "[资产-加密节点]" in line
+        or "node[s5" in low
+        or "node[socks" in low
+        or "socks5" in low
+        or "s5-open" in low
+        or "s5-auth" in low
+        or "需认证" in line
+        or ("s5" in low and "xui" not in low)
+    )
+    is_s5_verified = "[优质-真穿透]" in line or (
+        is_s5_audited
+        and (
+            "验证成功" in line
+            or "认证通过" in line
+            or "真穿透" in line
+            or "rtt:" in low
+        )
+    )
+
+    return is_xui_audited, is_xui_verified, is_s5_audited, is_s5_verified
+
+
+def to_ip_port_user_pass(line):
+    ip_port = "-"
+    user = "-"
+    pwd = "-"
+
+    m_ip = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})", line)
+    if m_ip:
+        ip_port = m_ip.group(1)
+
+    m_u = re.search(r"账号:([^|\s]+)", line)
+    m_p = re.search(r"密码:([^|\s]+)", line)
+    if m_u:
+        user = m_u.group(1)
+    if m_p:
+        pwd = m_p.group(1)
+
+    if user == "-":
+        m_at = re.search(r"Node\[[^\]]+\]:\s*([^@\s]+)@", line)
+        if m_at:
+            user = m_at.group(1)
+
+    if (user == "-" or pwd == "-") and m_ip:
+        m_old = re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}:([^:|\s]+):([^|\s]+)", line)
+        if m_old:
+            user = m_old.group(1)
+            pwd = m_old.group(2)
+
+    return f"{ip_port}:{user}:{pwd}"
 
 
 def clear_report_history():
@@ -713,6 +749,39 @@ def timed_input(prompt, timeout_sec=10.0):
     sys.stdout.write("\n")
     sys.stdout.flush()
     return ""
+
+
+def poll_zero_to_back(timeout_sec=0.5):
+    if timeout_sec <= 0:
+        return False
+
+    if os.name == "nt":
+        import msvcrt
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                if ch == "0":
+                    return True
+                if ch in ("\r", "\n"):
+                    continue
+            else:
+                time.sleep(0.05)
+        return False
+
+    rlist, _, _ = select.select([sys.stdin], [], [], timeout_sec)
+    if not rlist:
+        return False
+    try:
+        raw = sys.stdin.readline().strip()
+    except Exception:
+        return False
+    return raw == "0"
 
 
 def get_available_memory_mb():
@@ -1879,21 +1948,10 @@ def main_console():
                         recent = []
                     recent = [str(x) for x in recent]
                     xui_recent_audited = [
-                        l
-                        for l in recent
-                        if (
-                            "[资产-面板存活]" in l
-                            or "Asset[X-UI]" in l
-                            or "面板在线" in l
-                        )
+                        l for l in recent if classify_report_line(l)[0]
                     ]
                     xui_recent_verified = [
-                        l
-                        for l in recent
-                        if (
-                            "[高危-后台沦陷]" in l
-                            or ("Asset[X-UI]" in l and "验真成功" in l)
-                        )
+                        l for l in recent if classify_report_line(l)[1]
                     ]
                     xui_audited = merge_recent_lines(
                         xui_audited, xui_recent_audited, None
@@ -1901,6 +1959,19 @@ def main_console():
                     xui_verified = merge_recent_lines(
                         xui_verified, xui_recent_verified, None
                     )
+                    recent_ip_lines = [
+                        l
+                        for l in recent
+                        if re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", l)
+                    ]
+                    if int(st.get("xui_found", 0)) > 0 and not xui_audited:
+                        xui_audited = merge_recent_lines(
+                            xui_audited, recent_ip_lines, None
+                        )
+                    if int(st.get("xui_verified", 0)) > 0 and not xui_verified:
+                        xui_verified = merge_recent_lines(
+                            xui_verified, recent_ip_lines, None
+                        )
                     sig = (
                         int(st.get("xui_found", 0)),
                         int(st.get("xui_verified", 0)),
@@ -1921,18 +1992,19 @@ def main_console():
                         )
                         print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
                         print(
-                            "\n".join(xui_audited)
+                            "\n".join(to_ip_port_user_pass(l) for l in xui_audited)
                             if xui_audited
                             else f"{C_DIM}暂无X-UI审计数据{C_W}"
                         )
                         print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
                         print(
-                            "\n".join(xui_verified)
+                            "\n".join(to_ip_port_user_pass(l) for l in xui_verified)
                             if xui_verified
                             else f"{C_DIM}暂无X-UI验真数据{C_W}"
                         )
-                        print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
-                    time.sleep(0.5)
+                        print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                    if poll_zero_to_back(0.5):
+                        break
             except KeyboardInterrupt:
                 pass
 
@@ -2119,40 +2191,28 @@ def main_console():
                         recent = []
                     recent = [str(x) for x in recent]
                     s5_recent_audited = [
-                        l
-                        for l in recent
-                        if (
-                            "[节点-可连通]" in l
-                            or "[资产-加密节点]" in l
-                            or "Node[S5" in l
-                            or "SOCKS5" in l.upper()
-                            or "S5" in l.upper()
-                            or "S5-OPEN" in l
-                            or "S5-AUTH" in l
-                            or "需认证" in l
-                        )
+                        l for l in recent if classify_report_line(l)[2]
                     ]
                     s5_recent_verified = [
-                        l
-                        for l in recent
-                        if (
-                            "[优质-真穿透]" in l
-                            or ("Node[S5" in l and ("验证成功" in l or "认证通过" in l))
-                            or (
-                                ("S5" in l.upper() or "SOCKS5" in l.upper())
-                                and (
-                                    "验证成功" in l
-                                    or "认证通过" in l
-                                    or "真穿透" in l
-                                    or "RTT:" in l
-                                )
-                            )
-                        )
+                        l for l in recent if classify_report_line(l)[3]
                     ]
                     s5_audited = merge_recent_lines(s5_audited, s5_recent_audited, None)
                     s5_verified = merge_recent_lines(
                         s5_verified, s5_recent_verified, None
                     )
+                    recent_ip_lines = [
+                        l
+                        for l in recent
+                        if re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", l)
+                    ]
+                    if int(st.get("s5_found", 0)) > 0 and not s5_audited:
+                        s5_audited = merge_recent_lines(
+                            s5_audited, recent_ip_lines, None
+                        )
+                    if int(st.get("s5_verified", 0)) > 0 and not s5_verified:
+                        s5_verified = merge_recent_lines(
+                            s5_verified, recent_ip_lines, None
+                        )
                     sig = (
                         int(st.get("s5_found", 0)),
                         int(st.get("s5_verified", 0)),
@@ -2173,18 +2233,19 @@ def main_console():
                         )
                         print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
                         print(
-                            "\n".join(s5_audited)
+                            "\n".join(to_ip_port_user_pass(l) for l in s5_audited)
                             if s5_audited
                             else f"{C_DIM}暂无S5审计数据{C_W}"
                         )
                         print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
                         print(
-                            "\n".join(s5_verified)
+                            "\n".join(to_ip_port_user_pass(l) for l in s5_verified)
                             if s5_verified
                             else f"{C_DIM}暂无S5验真数据{C_W}"
                         )
-                        print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
-                    time.sleep(0.5)
+                        print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                    if poll_zero_to_back(0.5):
+                        break
             except KeyboardInterrupt:
                 pass
 
