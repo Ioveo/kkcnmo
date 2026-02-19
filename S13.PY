@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1246,7 +1246,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     save_state(STATE_FILE, state)
 
 
-# ==================== 管理界面  ====================
+# ==================== 管理界面 (极光UI版) ====================
 
 
 def main_console():
@@ -1272,7 +1272,7 @@ def main_console():
             f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
         print(
-            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}t天才猫{C_BLUE}                 ┃{C_W}"
+            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫{C_BLUE}                 ┃{C_W}"
         )
         print(
             f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
@@ -1518,16 +1518,30 @@ def main_console():
             found_output = read_last_lines(
                 REPORT_FILE,
                 lines=200,
-                filter_keywords=["存活", "连通", "加密节点"],
+                filter_keywords=[
+                    "存活",
+                    "连通",
+                    "加密节点",
+                    "发现成功",
+                    "Asset[X-UI]",
+                    "Node[S5",
+                ],
+            )
+            s5_output = read_last_lines(
+                REPORT_FILE,
+                lines=200,
+                filter_keywords=["Node[S5", "S5-OPEN", "S5-AUTH", "连通", "加密节点"],
             )
             verified_output = read_last_lines(
                 REPORT_FILE,
                 lines=200,
-                filter_keywords=["沦陷", "真穿透"],
+                filter_keywords=["沦陷", "真穿透", "验证成功", "认证通过"],
             )
 
             print(f"\n{C_CYAN}>>> 发现资产列表 (存活/连通){C_W}\n")
             print(found_output if found_output else f"{C_DIM}暂无发现数据{C_W}")
+            print(f"\n{C_CYAN}>>> S5 资产列表{C_W}\n")
+            print(s5_output if s5_output else f"{C_DIM}暂无S5资产数据{C_W}")
             print(f"\n{C_CYAN}>>> 验真结果 (真实可用){C_W}\n")
             print(verified_output if verified_output else f"{C_DIM}暂无验真数据{C_W}")
             input(f"\n{C_BLUE}按回车返回...{C_W}")
