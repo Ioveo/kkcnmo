@@ -1473,7 +1473,7 @@ def main_console():
         print(
             f"{panel_border}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
-        print(panel_line(f"SAIA MASTER CONSOLE v23.5 |  天才猫"))
+        print(panel_line(f"SAIA MASTER CONSOLE 加油 | 天才猫"))
         print(
             f"{panel_border}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
