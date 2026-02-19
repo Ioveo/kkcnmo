@@ -181,28 +181,36 @@ def read_last_lines(path, lines=50, filter_keywords=None):
 def collect_report_sections(limit=None):
     xui_audited, xui_verified = [], []
     s5_audited, s5_verified = [], []
-    if not os.path.exists(REPORT_FILE):
+    report_paths = []
+    for i in range(REPORT_BACKUPS, 0, -1):
+        p = f"{REPORT_FILE}.{i}"
+        if os.path.exists(p):
+            report_paths.append(p)
+    if os.path.exists(REPORT_FILE):
+        report_paths.append(REPORT_FILE)
+    if not report_paths:
         return xui_audited, xui_verified, s5_audited, s5_verified
 
     try:
-        with open(REPORT_FILE, "r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.rstrip("\n")
-                if not line:
-                    continue
+        for rp in report_paths:
+            with open(rp, "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    if not line:
+                        continue
 
-                is_xui_audited, is_xui_verified, is_s5_audited, is_s5_verified = (
-                    classify_report_line(line)
-                )
+                    is_xui_audited, is_xui_verified, is_s5_audited, is_s5_verified = (
+                        classify_report_line(line)
+                    )
 
-                if is_xui_audited:
-                    xui_audited.append(line)
-                if is_xui_verified:
-                    xui_verified.append(line)
-                if is_s5_audited:
-                    s5_audited.append(line)
-                if is_s5_verified:
-                    s5_verified.append(line)
+                    if is_xui_audited:
+                        xui_audited.append(line)
+                    if is_xui_verified:
+                        xui_verified.append(line)
+                    if is_s5_audited:
+                        s5_audited.append(line)
+                    if is_s5_verified:
+                        s5_verified.append(line)
     except OSError:
         pass
 
@@ -1264,8 +1272,8 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                         async with state_lock:
                             state["s5_verified"] += 1
                         return f"[优质-真穿透] {ip}:{port} | S5-OPEN | {country} | {asn} | RTT:{lat}ms"
-                    elif work_mode == 2:
-                        return f"[节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn} | 仅握手成功"
+                    elif work_mode in (2, 3):
+                        return f"[节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn} | 无L7能力"
             finally:
                 await close_writer(w2)
 
@@ -1312,12 +1320,15 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                             async with state_lock:
                                 state["s5_verified"] += 1
                             return f"[优质-真穿透] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
-                        elif work_mode == 2:
+                        elif work_mode in (2, 3):
                             return f"[节点-可连通] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
                 except (asyncio.TimeoutError, OSError, ValueError):
                     continue
                 finally:
                     await close_writer(w3)
+
+            if work_mode in (2, 3):
+                return f"[节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
     except (asyncio.TimeoutError, OSError, ValueError):
         pass
     finally:
@@ -1340,6 +1351,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "xui_verified": 0,
         "s5_found": 0,
         "s5_verified": 0,
+        "verifying": 0,
         "active_workers": 0,
         "work_mode": work_mode,
         "recent": [],
@@ -1433,12 +1445,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
     def build_interval_message(snapshot, recent_lines):
         return (
-            f"SAIA 审计定时推送\n"
+            f"【天才猫】\n"
             f"模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n"
             f"进度: {snapshot.get('done', 0)}/{snapshot.get('total', 0)}\n"
-            f"XUI: 发现 {snapshot.get('xui_found', 0)} / 验真 {snapshot.get('xui_verified', 0)}\n"
-            f"S5: 连通 {snapshot.get('s5_found', 0)} / 验真 {snapshot.get('s5_verified', 0)}\n"
-            f"最近:\n" + ("\n".join(recent_lines) if recent_lines else "-")
+            f"发现面板: XUI {snapshot.get('xui_found', 0)} | S5 {snapshot.get('s5_found', 0)}\n"
+            f"验真结果: XUI {snapshot.get('xui_verified', 0)} | S5 {snapshot.get('s5_verified', 0)}\n"
+            f"最新:\n" + ("\n".join(recent_lines) if recent_lines else "-")
         )
 
     async def flush_state_loop():
@@ -1552,14 +1564,42 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     if tg_enabled and tg_condition_mode in (1, 2, 3):
                         matched = [r for r in found_res if should_push_condition(r)]
                         if matched:
+                            async with state_lock:
+                                matched_snapshot = {
+                                    "done": state.get("done", 0),
+                                    "total": state.get("total", 0),
+                                    "xui_found": state.get("xui_found", 0),
+                                    "xui_verified": state.get("xui_verified", 0),
+                                    "s5_found": state.get("s5_found", 0),
+                                    "s5_verified": state.get("s5_verified", 0),
+                                }
                             schedule_telegram(
-                                "SAIA 条件命中推送\n" + "\n".join(matched)
+                                build_interval_message(matched_snapshot, matched)
                             )
+
+                async def run_with_verify_counter(coro):
+                    if work_mode not in (2, 3):
+                        return await coro
+                    async with state_lock:
+                        state["verifying"] = state.get("verifying", 0) + 1
+                    try:
+                        return await coro
+                    finally:
+                        async with state_lock:
+                            state["verifying"] = max(0, state.get("verifying", 0) - 1)
 
                 if mode in (1, 3):
                     for p in xui_ports:
-                        x_r = await audit_xui(
-                            ip, p, tokens, state, state_lock, work_mode, conn_limiter
+                        x_r = await run_with_verify_counter(
+                            audit_xui(
+                                ip,
+                                p,
+                                tokens,
+                                state,
+                                state_lock,
+                                work_mode,
+                                conn_limiter,
+                            )
                         )
                         if x_r:
                             await handle_found_results([x_r])
@@ -1567,8 +1607,16 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
                 if mode in (2, 3):
                     for p in s5_ports:
-                        s_r = await audit_socks5(
-                            ip, p, tokens, state, state_lock, work_mode, conn_limiter
+                        s_r = await run_with_verify_counter(
+                            audit_socks5(
+                                ip,
+                                p,
+                                tokens,
+                                state,
+                                state_lock,
+                                work_mode,
+                                conn_limiter,
+                            )
                         )
                         if s_r:
                             await handle_found_results([s_r])
@@ -1621,8 +1669,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     save_state(CHECKPOINT_FILE, quick_cp_snapshot)
                 if special_snapshot is not None:
                     schedule_telegram(
-                        "SAIA 触发推送: 验真数量达到阈值\n"
-                        + build_interval_message(special_snapshot, special_recent)
+                        build_interval_message(special_snapshot, special_recent)
                     )
             except Exception:
                 log_exception(f"worker crash ip={ip}")
@@ -1730,10 +1777,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         final_recent = list(state.get("recent", []))[-5:]
         if tg_condition_mode == 4:
             if not special_or_sent:
-                schedule_telegram(
-                    "SAIA 触发推送: 全部 IP 审计完成\n"
-                    + build_interval_message(final_snapshot, final_recent)
-                )
+                schedule_telegram(build_interval_message(final_snapshot, final_recent))
         else:
             schedule_telegram(build_interval_message(final_snapshot, final_recent))
     flush_stop.set()
@@ -1783,6 +1827,7 @@ def main_console():
         s5_audited = int(s.get("s5_found", 0))
         xui_verified = int(s.get("xui_verified", 0))
         s5_verified = int(s.get("s5_verified", 0))
+        verifying_now = int(s.get("verifying", 0))
         done = int(s.get("done", 0))
         total = int(s.get("total", 0))
         fed = int(s.get("fed", 0))
@@ -1853,7 +1898,7 @@ def main_console():
         print(panel_line(f"{C_W}进度条:{main_bar}"))
         print(
             panel_line(
-                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}"
+                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}{C_W} {panel_border}| {C_W}正在验真:{C_CYAN}{verifying_now}"
             )
         )
         print(
@@ -1986,30 +2031,7 @@ def main_console():
                     xui_audited, xui_verified, _, _ = collect_report_sections(
                         limit=None
                     )
-                    recent = st.get("recent", [])
-                    if not isinstance(recent, list):
-                        recent = []
-                    recent = [str(x) for x in recent]
-                    xui_recent_audited = [
-                        l for l in recent if classify_report_line(l)[0]
-                    ]
-                    xui_recent_verified = [
-                        l for l in recent if classify_report_line(l)[1]
-                    ]
-                    xui_audited = list(xui_audited) + list(xui_recent_audited)
-                    xui_verified = list(xui_verified) + list(xui_recent_verified)
-                    recent_ip_lines = [
-                        l
-                        for l in recent
-                        if re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", l)
-                    ]
-                    if int(st.get("xui_found", 0)) > 0 and not xui_audited:
-                        xui_audited = list(xui_audited) + list(recent_ip_lines)
-                    if int(st.get("xui_verified", 0)) > 0 and not xui_verified:
-                        xui_verified = list(xui_verified) + list(recent_ip_lines)
                     sig = (
-                        int(st.get("xui_found", 0)),
-                        int(st.get("xui_verified", 0)),
                         len(xui_audited),
                         len(xui_verified),
                         xui_audited[-1] if xui_audited else "",
@@ -2018,20 +2040,20 @@ def main_console():
                     if sig != last_sig:
                         last_sig = sig
                         os.system("cls" if os.name == "nt" else "clear")
-                        print(f"\n{C_CYAN}>>> X-UI 审计实时面板(有新结果才刷新){C_W}")
+                        print(f"\n{C_CYAN}>>> X-UI 审计实时面板{C_W}")
                         print(
-                            f"已审计: {C_CYAN}{st.get('xui_found', 0)}{C_W} | 已验真: {C_WARN}{st.get('xui_verified', 0)}{C_W}"
+                            f"发现: {C_CYAN}{len(xui_audited)}{C_W} | 验证成功: {C_WARN}{len(xui_verified)}{C_W}"
                         )
                         print(
                             f"最新IP: 审计 {C_CYAN}{latest_ip_port(xui_audited)}{C_W} | 验真 {C_WARN}{latest_ip_port(xui_verified)}{C_W}"
                         )
-                        print(f"\n{C_CYAN}[X-UI 已审计]{C_W}\n")
+                        print(f"\n{C_CYAN}[X-UI 发现]{C_W}\n")
                         print(
                             "\n".join(format_result_line(l, "xui") for l in xui_audited)
                             if xui_audited
                             else f"{C_DIM}暂无X-UI审计数据{C_W}"
                         )
-                        print(f"\n{C_CYAN}[X-UI 已验真]{C_W}\n")
+                        print(f"\n{C_CYAN}[X-UI 验证成功]{C_W}\n")
                         print(
                             "\n".join(
                                 format_result_line(l, "xui") for l in xui_verified
@@ -2234,30 +2256,7 @@ def main_console():
                 while True:
                     st = load_state(STATE_FILE)
                     _, _, s5_audited, s5_verified = collect_report_sections(limit=None)
-                    recent = st.get("recent", [])
-                    if not isinstance(recent, list):
-                        recent = []
-                    recent = [str(x) for x in recent]
-                    s5_recent_audited = [
-                        l for l in recent if classify_report_line(l)[2]
-                    ]
-                    s5_recent_verified = [
-                        l for l in recent if classify_report_line(l)[3]
-                    ]
-                    s5_audited = list(s5_audited) + list(s5_recent_audited)
-                    s5_verified = list(s5_verified) + list(s5_recent_verified)
-                    recent_ip_lines = [
-                        l
-                        for l in recent
-                        if re.search(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", l)
-                    ]
-                    if int(st.get("s5_found", 0)) > 0 and not s5_audited:
-                        s5_audited = list(s5_audited) + list(recent_ip_lines)
-                    if int(st.get("s5_verified", 0)) > 0 and not s5_verified:
-                        s5_verified = list(s5_verified) + list(recent_ip_lines)
                     sig = (
-                        int(st.get("s5_found", 0)),
-                        int(st.get("s5_verified", 0)),
                         len(s5_audited),
                         len(s5_verified),
                         s5_audited[-1] if s5_audited else "",
@@ -2266,14 +2265,14 @@ def main_console():
                     if sig != last_sig:
                         last_sig = sig
                         os.system("cls" if os.name == "nt" else "clear")
-                        print(f"\n{C_CYAN}>>> S5 审计实时面板(有新结果才刷新){C_W}")
+                        print(f"\n{C_CYAN}>>> S5 审计实时面板{C_W}")
                         print(
-                            f"已审计: {C_CYAN}{st.get('s5_found', 0)}{C_W} | 已验真: {C_SUCC}{st.get('s5_verified', 0)}{C_W}"
+                            f"发现: {C_CYAN}{len(s5_audited)}{C_W} | 验证成功: {C_SUCC}{len(s5_verified)}{C_W}"
                         )
                         print(
                             f"最新IP: 审计 {C_CYAN}{latest_ip_port(s5_audited)}{C_W} | 验真 {C_SUCC}{latest_ip_port(s5_verified)}{C_W}"
                         )
-                        print(f"\n{C_CYAN}[S5 已审计]{C_W}\n")
+                        print(f"\n{C_CYAN}[S5 发现]{C_W}\n")
                         print(
                             "\n".join(
                                 format_result_line(l, "socks5") for l in s5_audited
@@ -2281,7 +2280,7 @@ def main_console():
                             if s5_audited
                             else f"{C_DIM}暂无S5审计数据{C_W}"
                         )
-                        print(f"\n{C_CYAN}[S5 已验真]{C_W}\n")
+                        print(f"\n{C_CYAN}[S5 验证成功]{C_W}\n")
                         print(
                             "\n".join(
                                 format_result_line(l, "socks5") for l in s5_verified
