@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -940,6 +940,16 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state["socket_in_use"] = 0
     state["free_mb"] = get_available_memory_mb()
 
+    if mode == 3:
+        xui_ports = parse_ports(DEFAULT_XUI_PORTS)
+        s5_ports = parse_ports(DEFAULT_S5_PORTS)
+    elif mode == 1:
+        xui_ports = list(ports)
+        s5_ports = []
+    else:
+        xui_ports = []
+        s5_ports = list(ports)
+
     async def push_telegram(text):
         if not tg_enabled:
             return
@@ -1079,44 +1089,44 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     state["current"] = f"Auditing -> {ip}"
                     state["active_workers"] = state.get("active_workers", 0) + 1
                     active_started = True
-                x_done = mode == 2
-                s_done = mode == 1
-                for p in ports:
-                    found_res = []
-                    if mode in (1, 3) and not x_done:
+
+                async def handle_found_results(found_res):
+                    if not found_res:
+                        return
+                    async with state_lock:
+                        for r in found_res:
+                            state["recent"] = (state["recent"] + [r])[-6:]
+                    for r in found_res:
+                        append_rotating(
+                            REPORT_FILE,
+                            r + "\n",
+                            MAX_REPORT_BYTES,
+                            REPORT_BACKUPS,
+                        )
+                    if tg_enabled and tg_condition_mode in (1, 2, 3):
+                        matched = [r for r in found_res if should_push_condition(r)]
+                        if matched:
+                            schedule_telegram(
+                                "SAIA 条件命中推送\n" + "\n".join(matched)
+                            )
+
+                if mode in (1, 3):
+                    for p in xui_ports:
                         x_r = await audit_xui(
                             ip, p, tokens, state, state_lock, work_mode, conn_limiter
                         )
                         if x_r:
-                            found_res.append(x_r)
-                            x_done = True
-                    if mode in (2, 3) and not s_done:
+                            await handle_found_results([x_r])
+                            break
+
+                if mode in (2, 3):
+                    for p in s5_ports:
                         s_r = await audit_socks5(
                             ip, p, tokens, state, state_lock, work_mode, conn_limiter
                         )
                         if s_r:
-                            found_res.append(s_r)
-                            s_done = True
-
-                    if found_res:
-                        async with state_lock:
-                            for r in found_res:
-                                state["recent"] = (state["recent"] + [r])[-6:]
-                        for r in found_res:
-                            append_rotating(
-                                REPORT_FILE,
-                                r + "\n",
-                                MAX_REPORT_BYTES,
-                                REPORT_BACKUPS,
-                            )
-                        if tg_enabled and tg_condition_mode in (1, 2, 3):
-                            matched = [r for r in found_res if should_push_condition(r)]
-                            if matched:
-                                schedule_telegram(
-                                    "SAIA 条件命中推送\n" + "\n".join(matched)
-                                )
-                    if x_done and s_done:
-                        break
+                            await handle_found_results([s_r])
+                            break
                 async with state_lock:
                     state["done"] += 1
                     state["current"] = f"Completed -> {ip}"
@@ -1262,7 +1272,7 @@ def main_console():
             f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
         print(
-            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫{C_BLUE}                 ┃{C_W}"
+            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}t天才猫{C_BLUE}                 ┃{C_W}"
         )
         print(
             f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
