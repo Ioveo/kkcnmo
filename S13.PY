@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) 
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1403,7 +1403,7 @@ def main_console():
     spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     spin_idx = 0
     panel_inner = 74
-    panel_border = C_DIM
+    panel_border = C_BLUE
 
     def visible_width(text):
         clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -1427,8 +1427,8 @@ def main_console():
         g = load_state(GUARDIAN_STATE_FILE)
         resume_cfg = load_resume_config()
         tg_cfg = load_telegram_config()
-        p_status = f"{C_SUCC}ON{C_W}" if is_alive(s.get("pid")) else f"{C_DIM}OFF{C_W}"
-        g_status = f"{C_SUCC}ON{C_W}" if is_alive(g.get("pid")) else f"{C_DIM}OFF{C_W}"
+        p_status = f"{C_W}ON{C_W}" if is_alive(s.get("pid")) else f"{C_DIM}OFF{C_W}"
+        g_status = f"{C_W}ON{C_W}" if is_alive(g.get("pid")) else f"{C_DIM}OFF{C_W}"
         xui_audited = int(s.get("xui_found", 0))
         s5_audited = int(s.get("s5_found", 0))
         xui_verified = int(s.get("xui_verified", 0))
@@ -1459,12 +1459,10 @@ def main_console():
         cpu_text = f"{local_cpu:.1f}%" if isinstance(local_cpu, (int, float)) else "-"
         work_mode_text = work_mode_label(s.get("work_mode", 2))
         resume_status = (
-            f"{C_SUCC}ON{C_W}"
-            if resume_cfg.get("enabled", True)
-            else f"{C_DIM}OFF{C_W}"
+            f"{C_W}ON{C_W}" if resume_cfg.get("enabled", True) else f"{C_DIM}OFF{C_W}"
         )
         tg_status = (
-            f"{C_SUCC}ON{C_W}"
+            f"{C_W}ON{C_W}"
             if tg_cfg.get("enabled")
             and tg_cfg.get("bot_token")
             and tg_cfg.get("chat_id")
@@ -1475,7 +1473,7 @@ def main_console():
         print(
             f"{panel_border}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
-        print(panel_line(f"SAIA MASTER CONSOLE  |     天才猫"))
+        print(panel_line(f"SAIA MASTER CONSOLE v23.5 |   天才猫"))
         print(
             f"{panel_border}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
