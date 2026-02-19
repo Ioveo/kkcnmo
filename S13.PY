@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -561,6 +561,104 @@ def get_available_memory_mb():
         except OSError:
             return None
     return 1024.0
+
+
+def get_total_memory_mb():
+    if os.name == "nt":
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullTotalPhys / 1024 / 1024
+        return None
+
+    meminfo = "/proc/meminfo"
+    if os.path.exists(meminfo):
+        try:
+            with open(meminfo, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) / 1024
+        except OSError:
+            return None
+    return None
+
+
+def get_cpu_usage_percent():
+    if os.name == "nt":
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", ctypes.c_ulong),
+                ("dwHighDateTime", ctypes.c_ulong),
+            ]
+
+        idle_t, kernel_t, user_t = FILETIME(), FILETIME(), FILETIME()
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle_t), ctypes.byref(kernel_t), ctypes.byref(user_t)
+        )
+        if not ok:
+            return None
+
+        def to_int(ft):
+            return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+        idle = to_int(idle_t)
+        kernel = to_int(kernel_t)
+        user = to_int(user_t)
+        total = kernel + user
+
+        prev = getattr(get_cpu_usage_percent, "_win_prev", None)
+        setattr(get_cpu_usage_percent, "_win_prev", (idle, total))
+        if not prev:
+            return None
+        idle_delta = idle - prev[0]
+        total_delta = total - prev[1]
+        if total_delta <= 0:
+            return None
+        return max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
+
+    proc_stat = "/proc/stat"
+    if os.path.exists(proc_stat):
+        try:
+            with open(proc_stat, "r", encoding="utf-8", errors="replace") as f:
+                line = f.readline().strip()
+            if not line.startswith("cpu "):
+                return None
+            vals = [int(x) for x in line.split()[1:]]
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+            total = sum(vals)
+            prev = getattr(get_cpu_usage_percent, "_linux_prev", None)
+            setattr(get_cpu_usage_percent, "_linux_prev", (idle, total))
+            if not prev:
+                return None
+            idle_delta = idle - prev[0]
+            total_delta = total - prev[1]
+            if total_delta <= 0:
+                return None
+            return max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
+        except (OSError, ValueError):
+            return None
+
+    try:
+        load = os.getloadavg()[0]
+        cpu_count = max(1, os.cpu_count() or 1)
+        return max(0.0, min(100.0, (load / cpu_count) * 100.0))
+    except (OSError, AttributeError):
+        return None
 
 
 class AdaptiveLimiter:
@@ -1253,11 +1351,19 @@ def main_console():
     # 动态加载旋转图标
     spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     spin_idx = 0
+    panel_inner = 74
+
+    def panel_line(text):
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        pad = max(0, panel_inner - 1 - len(plain))
+        return f"{C_BLUE}┃ {text}{' ' * pad}{C_BLUE}┃{C_W}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         s = load_state(STATE_FILE)
         g = load_state(GUARDIAN_STATE_FILE)
+        resume_cfg = load_resume_config()
+        tg_cfg = load_telegram_config()
         p_status = (
             f"{C_SUCC}ON{C_BLUE}" if is_alive(s.get("pid")) else f"{C_DIM}OFF{C_BLUE}"
         )
@@ -1266,22 +1372,79 @@ def main_console():
         )
         xui_audited = int(s.get("xui_found", 0))
         s5_audited = int(s.get("s5_found", 0))
+        xui_verified = int(s.get("xui_verified", 0))
+        s5_verified = int(s.get("s5_verified", 0))
+        done = int(s.get("done", 0))
+        total = int(s.get("total", 0))
+        active_workers = int(s.get("active_workers", 0))
+        socket_limit = int(s.get("socket_limit", 0))
+        socket_in_use = int(s.get("socket_in_use", 0))
+        current = str(s.get("current", "-"))
+        if len(current) > 26:
+            current = current[:26] + "..."
+        local_free_mb = get_available_memory_mb()
+        local_total_mb = get_total_memory_mb()
+        local_cpu = get_cpu_usage_percent()
+        mem_text = "-"
+        if (
+            isinstance(local_free_mb, (int, float))
+            and isinstance(local_total_mb, (int, float))
+            and local_total_mb > 0
+        ):
+            used_pct = max(
+                0.0, min(100.0, (1.0 - local_free_mb / local_total_mb) * 100.0)
+            )
+            mem_text = f"{local_free_mb:.0f}/{local_total_mb:.0f}MB({used_pct:.1f}%)"
+        elif isinstance(local_free_mb, (int, float)):
+            mem_text = f"Free {local_free_mb:.0f}MB"
+        cpu_text = f"{local_cpu:.1f}%" if isinstance(local_cpu, (int, float)) else "-"
+        work_mode_text = work_mode_label(s.get("work_mode", 2))
+        resume_status = (
+            f"{C_SUCC}ON{C_BLUE}"
+            if resume_cfg.get("enabled", True)
+            else f"{C_DIM}OFF{C_BLUE}"
+        )
+        tg_status = (
+            f"{C_SUCC}ON{C_BLUE}"
+            if tg_cfg.get("enabled")
+            and tg_cfg.get("bot_token")
+            and tg_cfg.get("chat_id")
+            else f"{C_DIM}OFF{C_BLUE}"
+        )
 
         # 极光面板头部
         print(
-            f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
+            f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
         print(
-            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫{C_BLUE}                 ┃{C_W}"
+            panel_line(f"{C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫")
         )
         print(
-            f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+            f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
         print(
-            f"{C_BLUE}┃ {C_W}审计引擎:{p_status} {C_BLUE}| {C_W}自启守护:{g_status} {C_BLUE}| {C_W}XUI已审计:{C_CYAN}{xui_audited}{C_W} {C_BLUE}| {C_W}S5已审计:{C_CYAN}{s5_audited}{C_BLUE} ┃{C_W}"
+            panel_line(
+                f"{C_W}审计引擎:{p_status} {C_BLUE}| {C_W}自启守护:{g_status} {C_BLUE}| {C_W}断点续连:{resume_status} {C_BLUE}| {C_W}Telegram:{tg_status}"
+            )
         )
         print(
-            f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
+            panel_line(
+                f"{C_W}进度:{C_CYAN}{done}{C_W}/{total} {C_BLUE}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {C_BLUE}| {C_W}工作模式:{C_CYAN}{work_mode_text}"
+            )
+        )
+        print(
+            panel_line(
+                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {C_BLUE}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}"
+            )
+        )
+        print(
+            panel_line(
+                f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {C_BLUE}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {C_BLUE}| {C_W}内存:{C_CYAN}{mem_text}{C_W}"
+            )
+        )
+        print(panel_line(f"{C_W}当前:{C_DIM}{current}{C_W}"))
+        print(
+            f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
         )
 
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
