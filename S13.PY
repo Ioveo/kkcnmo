@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 天才猫
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +43,7 @@ ADAPT_STEP_UP = 50
 ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
-EXPOSE_SECRET_IN_REPORT = False
+EXPOSE_SECRET_IN_REPORT = True
 MAX_EXPANDED_TARGETS_PER_ENTRY = 65536
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
@@ -862,6 +862,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "xui_verified": 0,
         "s5_found": 0,
         "s5_verified": 0,
+        "active_workers": 0,
         "work_mode": work_mode,
         "recent": [],
         "started_at": now_ts(),
@@ -1009,9 +1010,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             if ip is None:
                 q.task_done()
                 break
+            active_started = False
             try:
                 async with state_lock:
                     state["current"] = f"Auditing -> {ip}"
+                    state["active_workers"] = state.get("active_workers", 0) + 1
+                    active_started = True
                 x_done = mode == 2
                 s_done = mode == 1
                 for p in ports:
@@ -1082,6 +1086,11 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         + build_interval_message(special_snapshot, special_recent)
                     )
             finally:
+                if active_started:
+                    async with state_lock:
+                        state["active_workers"] = max(
+                            0, state.get("active_workers", 0) - 1
+                        )
                 q.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(threads)]
@@ -1262,7 +1271,7 @@ def main_console():
                         f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
                     )
                     print(
-                        f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {st.get('current', '-')[:36]:<36} {C_BLUE}┃{C_W}"
+                        f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {st.get('current', '-')[:24]:<24} 并行:{st.get('active_workers', 0):<4} {C_BLUE}┃{C_W}"
                     )
                     print(
                         f"{C_BLUE}┃ {C_W}总体进度   {C_BLUE}|{C_W} {bar} {C_BLUE}┃{C_W}"
