@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA)  - 天才猫
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,7 +46,7 @@ ADAPT_STEP_UP = 50
 ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
-EXPOSE_SECRET_IN_REPORT = False
+EXPOSE_SECRET_IN_REPORT = True
 MAX_EXPANDED_TARGETS_PER_ENTRY = 65536
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
@@ -145,15 +145,19 @@ def log_event(msg):
 
 # --- 用这段代码替换原有的 read_last_lines 函数 ---
 def read_last_lines(path, lines=50, filter_keywords=None):
-    if not os.path.exists(path): return ""
+    if not os.path.exists(path):
+        return ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
             # 如果按键11或3传来了关键词，就只保留包含这些词的行
             if filter_keywords:
-                all_lines = [l for l in all_lines if any(k in l for k in filter_keywords)]
+                all_lines = [
+                    l for l in all_lines if any(k in l for k in filter_keywords)
+                ]
             return "".join(all_lines[-lines:])
-    except: return ""
+    except:
+        return ""
 
 
 def mode_label(mode):
@@ -1232,7 +1236,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     save_state(STATE_FILE, state)
 
 
-# ==================== 管理界面 (极光UI版) ====================
+# ==================== 管理界面 (天才猫) ====================
 
 
 def main_console():
@@ -1256,7 +1260,7 @@ def main_console():
             f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
         print(
-            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}旗舰穿透版{C_BLUE}                 ┃{C_W}"
+            f"{C_BLUE}┃ {C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫{C_BLUE}                 ┃{C_W}"
         )
         print(
             f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
@@ -1498,11 +1502,23 @@ def main_console():
 
         elif c == "9":
             break
-        # --- 【新增】在这里插入按键 11 的代码 ---
         elif c == "11":
-            # 这里的 filter_keywords 确保按11只看“存活”但“未验证”的
-            print(f"\n{C_CYAN}>>> 发现资产列表 (存活在线){C_W}\n" + read_last_lines(REPORT_FILE, filter_keywords=["存活", "连通", "加密节点"]))
-            input("\n回车返回")
+            found_output = read_last_lines(
+                REPORT_FILE,
+                lines=200,
+                filter_keywords=["存活", "连通", "加密节点"],
+            )
+            verified_output = read_last_lines(
+                REPORT_FILE,
+                lines=200,
+                filter_keywords=["沦陷", "真穿透"],
+            )
+
+            print(f"\n{C_CYAN}>>> 发现资产列表 (存活/连通){C_W}\n")
+            print(found_output if found_output else f"{C_DIM}暂无发现数据{C_W}")
+            print(f"\n{C_CYAN}>>> 验真结果 (真实可用){C_W}\n")
+            print(verified_output if verified_output else f"{C_DIM}暂无验真数据{C_W}")
+            input(f"\n{C_BLUE}按回车返回...{C_W}")
 
 
 if __name__ == "__main__":
