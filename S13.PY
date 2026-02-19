@@ -1205,6 +1205,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "pid": os.getpid(),
         "total": 0,
         "done": 0,
+        "fed": 0,
+        "feed_total": 0,
         "xui_found": 0,
         "xui_verified": 0,
         "s5_found": 0,
@@ -1564,9 +1566,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         pending_targets = all_targets
 
     pending_total = len(pending_targets)
+    async with state_lock:
+        state["feed_total"] = pending_total
     for idx, target in enumerate(pending_targets, start=1):
         async with state_lock:
             state["current"] = f"Feeding target -> {target}"
+            state["fed"] = idx
         await q.put(target)
         if feed_int > 0:
             remaining_ratio = (pending_total - idx) / max(1, pending_total)
@@ -1650,6 +1655,8 @@ def main_console():
         s5_verified = int(s.get("s5_verified", 0))
         done = int(s.get("done", 0))
         total = int(s.get("total", 0))
+        fed = int(s.get("fed", 0))
+        feed_total = int(s.get("feed_total", 0))
         main_bar = render_progress_bar(done, total, width=24)
         progress_ratio = (done / total) if total > 0 else 0.0
         progress_pct = progress_ratio * 100.0
@@ -1705,7 +1712,7 @@ def main_console():
         )
         print(
             panel_line(
-                f"{C_W}进度:{C_CYAN}{done}{C_W}/{total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}"
+                f"{C_W}审计:{C_CYAN}{done}{C_W}/{total} {panel_border}| {C_W}喂入:{C_CYAN}{fed}{C_W}/{feed_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}"
             )
         )
         print(
