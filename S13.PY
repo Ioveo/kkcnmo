@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 
 # ============================================================
-#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
+#  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1403,6 +1403,7 @@ def main_console():
     spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     spin_idx = 0
     panel_inner = 74
+    panel_border = C_DIM
 
     def visible_width(text):
         clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -1418,7 +1419,7 @@ def main_console():
 
     def panel_line(text):
         pad = max(0, panel_inner - 1 - visible_width(text))
-        return f"{C_BLUE}┃ {text}{' ' * pad}{C_BLUE}┃{C_W}"
+        return f"{panel_border}┃ {text}{' ' * pad}{panel_border}┃{C_W}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -1426,12 +1427,8 @@ def main_console():
         g = load_state(GUARDIAN_STATE_FILE)
         resume_cfg = load_resume_config()
         tg_cfg = load_telegram_config()
-        p_status = (
-            f"{C_SUCC}ON{C_BLUE}" if is_alive(s.get("pid")) else f"{C_DIM}OFF{C_BLUE}"
-        )
-        g_status = (
-            f"{C_SUCC}ON{C_BLUE}" if is_alive(g.get("pid")) else f"{C_DIM}OFF{C_BLUE}"
-        )
+        p_status = f"{C_SUCC}ON{C_W}" if is_alive(s.get("pid")) else f"{C_DIM}OFF{C_W}"
+        g_status = f"{C_SUCC}ON{C_W}" if is_alive(g.get("pid")) else f"{C_DIM}OFF{C_W}"
         xui_audited = int(s.get("xui_found", 0))
         s5_audited = int(s.get("s5_found", 0))
         xui_verified = int(s.get("xui_verified", 0))
@@ -1462,51 +1459,49 @@ def main_console():
         cpu_text = f"{local_cpu:.1f}%" if isinstance(local_cpu, (int, float)) else "-"
         work_mode_text = work_mode_label(s.get("work_mode", 2))
         resume_status = (
-            f"{C_SUCC}ON{C_BLUE}"
+            f"{C_SUCC}ON{C_W}"
             if resume_cfg.get("enabled", True)
-            else f"{C_DIM}OFF{C_BLUE}"
+            else f"{C_DIM}OFF{C_W}"
         )
         tg_status = (
-            f"{C_SUCC}ON{C_BLUE}"
+            f"{C_SUCC}ON{C_W}"
             if tg_cfg.get("enabled")
             and tg_cfg.get("bot_token")
             and tg_cfg.get("chat_id")
-            else f"{C_DIM}OFF{C_BLUE}"
+            else f"{C_DIM}OFF{C_W}"
         )
 
         # 极光面板头部
         print(
-            f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
+            f"{panel_border}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
+        print(panel_line(f"SAIA MASTER CONSOLE  |     天才猫"))
         print(
-            panel_line(f"{C_BOLD}SAIA MASTER CONSOLE v23.5{C_W} | {C_CYAN}天才猫")
-        )
-        print(
-            f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+            f"{panel_border}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
         print(
             panel_line(
-                f"{C_W}审计引擎:{p_status} {C_BLUE}| {C_W}自启守护:{g_status} {C_BLUE}| {C_W}断点续连:{resume_status} {C_BLUE}| {C_W}Telegram:{tg_status}"
+                f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}"
             )
         )
         print(
             panel_line(
-                f"{C_W}进度:{C_CYAN}{done}{C_W}/{total} {C_BLUE}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {C_BLUE}| {C_W}工作模式:{C_CYAN}{work_mode_text}"
+                f"{C_W}进度:{C_CYAN}{done}{C_W}/{total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}"
             )
         )
         print(
             panel_line(
-                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {C_BLUE}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}"
+                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}"
             )
         )
         print(
             panel_line(
-                f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {C_BLUE}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {C_BLUE}| {C_W}内存:{C_CYAN}{mem_text}{C_W}"
+                f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}"
             )
         )
         print(panel_line(f"{C_W}当前:{C_DIM}{current}{C_W}"))
         print(
-            f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
+            f"{panel_border}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
         )
 
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
@@ -1818,4 +1813,3 @@ if __name__ == "__main__":
             raise SystemExit("Err")
     else:
         main_console()
-
