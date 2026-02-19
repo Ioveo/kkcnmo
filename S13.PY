@@ -12,6 +12,7 @@ import ctypes
 import ssl
 import re
 import unicodedata
+import select
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -500,6 +501,55 @@ def prompt_float(msg, default, min_value=None):
             print(f"输入过小。")
             continue
         return value
+
+
+def timed_input(prompt, timeout_sec=10.0):
+    if timeout_sec <= 0:
+        return input(prompt)
+
+    if os.name == "nt":
+        import msvcrt
+
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        buf = []
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(buf)
+                if ch == "\003":
+                    raise KeyboardInterrupt
+                if ch in ("\b", "\x7f"):
+                    if buf:
+                        buf.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                    continue
+                if ch in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                buf.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            else:
+                time.sleep(0.05)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return ""
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    rlist, _, _ = select.select([sys.stdin], [], [], timeout_sec)
+    if rlist:
+        return sys.stdin.readline().rstrip("\n")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return ""
 
 
 def get_available_memory_mb():
@@ -1466,9 +1516,12 @@ def main_console():
         print(f" 4) 查看日志  8) 停止守护")
         print(f" 7) 断点续连  11) 查看(发现)")
 
-        c = input(
-            f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}"
+        c = timed_input(
+            f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}",
+            timeout_sec=10.0,
         ).strip()
+        if not c:
+            continue
 
         if c == "1":
             print(f"\n{C_CYAN}>>> 配置审计参数{C_W}")
