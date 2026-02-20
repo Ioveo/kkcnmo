@@ -35,6 +35,7 @@ GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
 FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
+SOCKET_CFG_FILE = os.path.join(BASE_DIR, "socket_tune_config.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 CHECKPOINT_DONE_FILE = os.path.join(BASE_DIR, "audit_checkpoint_done.log")
 VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
@@ -555,6 +556,28 @@ def load_feed_turbo_config():
 
 def save_feed_turbo_config(cfg):
     save_state(FEED_CFG_FILE, cfg)
+
+
+def default_socket_tune_config():
+    return {"peak_limit": 0}
+
+
+def load_socket_tune_config():
+    cfg = default_socket_tune_config()
+    data = load_state(SOCKET_CFG_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+    try:
+        peak = int(cfg.get("peak_limit", 0))
+    except (TypeError, ValueError):
+        peak = 0
+    peak = max(0, min(MAX_SOCKET_CONCURRENCY, peak))
+    cfg["peak_limit"] = peak
+    return cfg
+
+
+def save_socket_tune_config(cfg):
+    save_state(SOCKET_CFG_FILE, cfg)
 
 
 def clear_checkpoint():
@@ -1670,11 +1693,13 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     resume_enabled = bool(resume_cfg.get("enabled", True))
     skip_scanned_enabled = bool(resume_cfg.get("skip_scanned", False))
     feed_cfg = load_feed_turbo_config()
+    socket_cfg = load_socket_tune_config()
     accel_trigger_ratio = float(
         feed_cfg.get("accel_trigger_ratio", FEED_ACCEL_TRIGGER_RATIO)
     )
     final_rush_ratio = float(feed_cfg.get("final_rush_ratio", FEED_FINAL_RUSH_RATIO))
     accel_factor = float(feed_cfg.get("accel_factor", FEED_ACCEL_FACTOR))
+    socket_peak_limit = int(socket_cfg.get("peak_limit", 0))
     session_key = f"{mode}|{work_mode}|{','.join(str(p) for p in ports)}"
     done_targets = set()
     checkpoint_pending_targets = []
@@ -1711,9 +1736,13 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     token_sem = asyncio.Semaphore(max(1, threads // 2))
     adaptive_min = min(ADAPT_MIN_CONCURRENCY, max(10, threads))
     adaptive_max = max(adaptive_min, min(threads, ADAPT_MAX_CONCURRENCY))
+    if socket_peak_limit > 0:
+        adaptive_max = min(adaptive_max, socket_peak_limit)
+        adaptive_min = min(adaptive_min, adaptive_max)
     socket_limit = max(50, min(MAX_SOCKET_CONCURRENCY, adaptive_max))
     conn_limiter = AdaptiveLimiter(socket_limit)
     state["socket_limit"] = socket_limit
+    state["socket_peak_limit"] = socket_peak_limit
     state["socket_in_use"] = 0
     state["free_mb"] = get_available_memory_mb()
 
@@ -2173,6 +2202,7 @@ def main_console():
         g = load_state(GUARDIAN_STATE_FILE)
         resume_cfg = load_resume_config()
         tg_cfg = load_telegram_config()
+        socket_cfg = load_socket_tune_config()
         p_status = f"{C_W}ON{C_W}" if is_alive(s.get("pid")) else f"{C_DIM}OFF{C_W}"
         g_status = f"{C_W}ON{C_W}" if is_alive(g.get("pid")) else f"{C_DIM}OFF{C_W}"
         xui_audited = int(s.get("xui_found", 0))
@@ -2192,6 +2222,7 @@ def main_console():
         ip_bar = "#" * ip_bar_fill + "-" * (ip_bar_width - ip_bar_fill)
         active_workers = int(s.get("active_workers", 0))
         socket_limit = int(s.get("socket_limit", 0))
+        socket_peak_limit = int(socket_cfg.get("peak_limit", 0))
         socket_in_use = int(s.get("socket_in_use", 0))
         current = str(s.get("current", "-"))
         if len(current) > 62:
@@ -2255,7 +2286,7 @@ def main_console():
         )
         print(
             panel_line(
-                f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}"
+                f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit}({C_CYAN}{'AUTO' if socket_peak_limit <= 0 else socket_peak_limit}{C_W}) {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}"
             )
         )
         print(panel_line(f"{C_W}当前:{C_DIM}{current}{C_W}"))
@@ -2266,9 +2297,9 @@ def main_console():
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
         print(f" 1) 启动审计             2) 监控面板             3) X-UI审计/验真")
         print(f" 4) 查看日志             5) 停止审计             6) 启动守护")
-        print(f" 7) 断点续连             8) 停止守护             9) 退出系统")
+        print(f" 7) 断点续连             8) 停止守护             9) Socket峰值")
         print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
-        print(f"13) 清空审计结果        14) 清空审计结果")
+        print(f"13) 清空审计结果        14) 清空审计结果        0) 退出系统")
 
         try:
             c = timed_input(
@@ -2609,6 +2640,31 @@ def main_console():
             time.sleep(1)
 
         elif c == "9":
+            scfg = load_socket_tune_config()
+            cur_peak = int(scfg.get("peak_limit", 0))
+            print(f"\n{C_CYAN}>>> Socket 峰值配置{C_W}")
+            print(
+                f"当前峰值: {cur_peak if cur_peak > 0 else 'AUTO(跟随线程并受系统上限约束)'}"
+            )
+            print(f"输入范围: 0~{MAX_SOCKET_CONCURRENCY} (0=自动, 留空保持不变)")
+            raw_peak = input("Socket峰值: ").strip()
+            if raw_peak:
+                try:
+                    new_peak = int(raw_peak)
+                    if 0 <= new_peak <= MAX_SOCKET_CONCURRENCY:
+                        scfg["peak_limit"] = new_peak
+                        save_socket_tune_config(scfg)
+                        print(
+                            f"{C_SUCC}>>> 已保存 Socket 峰值: {new_peak if new_peak > 0 else 'AUTO'}{C_W}"
+                        )
+                        print(f"{C_DIM}提示: 下一次启动审计生效{C_W}")
+                    else:
+                        print(f"{C_WARN}输入超出范围，未修改{C_W}")
+                except ValueError:
+                    print(f"{C_WARN}输入无效，未修改{C_W}")
+            time.sleep(1.2)
+
+        elif c == "0":
             break
         elif c == "11":
             try:
