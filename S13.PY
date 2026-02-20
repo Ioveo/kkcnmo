@@ -51,6 +51,9 @@ MAX_SOCKET_CONCURRENCY = 2000
 FEED_ACCEL_TRIGGER_RATIO = 0.5
 FEED_FINAL_RUSH_RATIO = 0.1
 FEED_ACCEL_FACTOR = 0.5
+FEED_QUEUE_MIN_SIZE = 256
+FEED_QUEUE_MAX_SIZE = 1200
+FEED_QUEUE_PER_THREAD = 1
 ADAPT_CHECK_INTERVAL = 2.0
 ADAPT_MIN_CONCURRENCY = 100
 ADAPT_MAX_CONCURRENCY = 2000
@@ -1319,6 +1322,7 @@ def run_guardian(
     last_restart_ts = 0.0
     min_restart_gap = max(10.0, float(check_interval))
     completed_notice_logged = False
+    manual_stop_notice_logged = False
     notified_dead_pid = None
     while True:
         mem_mb = get_available_memory_mb()
@@ -1335,10 +1339,28 @@ def run_guardian(
                         "【天才猫】\n守护待机\n上次任务已完成，等待手动启动"
                     )
                     completed_notice_logged = True
+                manual_stop_notice_logged = False
                 gs = load_state(GUARDIAN_STATE_FILE)
                 gs["updated_at"] = now_ts()
                 gs["last_free_mb"] = mem_mb
                 gs["last_note"] = "idle_completed"
+                save_state(GUARDIAN_STATE_FILE, gs)
+                time.sleep(check_interval)
+                continue
+            if st_status in ("stopped_manual", "manual_stopped", "stopped_by_user"):
+                if not manual_stop_notice_logged:
+                    log_event(
+                        "Guardian idle: manual stop detected, waiting manual restart"
+                    )
+                    guardian_tg_push(
+                        "【天才猫】\n守护待机\n检测到手动停止，等待手动启动"
+                    )
+                    manual_stop_notice_logged = True
+                completed_notice_logged = False
+                gs = load_state(GUARDIAN_STATE_FILE)
+                gs["updated_at"] = now_ts()
+                gs["last_free_mb"] = mem_mb
+                gs["last_note"] = "idle_manual_stop"
                 save_state(GUARDIAN_STATE_FILE, gs)
                 time.sleep(check_interval)
                 continue
@@ -1368,12 +1390,14 @@ def run_guardian(
                         f"【天才猫】\n守护已重启审计进程\n模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n线程: {threads}"
                     )
                     completed_notice_logged = False
+                    manual_stop_notice_logged = False
             else:
                 log_event(
                     f"Guardian wait: low memory {mem_mb:.0f}MB < {min_free_mb:.0f}MB"
                 )
         else:
             completed_notice_logged = False
+            manual_stop_notice_logged = False
             notified_dead_pid = None
         gs = load_state(GUARDIAN_STATE_FILE)
         gs["updated_at"] = now_ts()
@@ -1732,7 +1756,11 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     special_or_sent = False
     notify_tasks = set()
 
-    q = asyncio.Queue(maxsize=max(threads * 4, 4096))
+    queue_maxsize = max(
+        FEED_QUEUE_MIN_SIZE,
+        min(FEED_QUEUE_MAX_SIZE, threads * FEED_QUEUE_PER_THREAD),
+    )
+    q = asyncio.Queue(maxsize=queue_maxsize)
     token_sem = asyncio.Semaphore(max(1, threads // 2))
     adaptive_min = min(ADAPT_MIN_CONCURRENCY, max(10, threads))
     adaptive_max = max(adaptive_min, min(threads, ADAPT_MAX_CONCURRENCY))
@@ -1744,6 +1772,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state["socket_limit"] = socket_limit
     state["socket_peak_limit"] = socket_peak_limit
     state["socket_in_use"] = 0
+    state["feed_queue_max"] = queue_maxsize
     state["free_mb"] = get_available_memory_mb()
 
     if mode == 3:
@@ -2105,21 +2134,11 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
                             if feed_int > 0:
                                 queue_fill_ratio = q.qsize() / max(1, q.maxsize)
-                                if queue_fill_ratio <= final_rush_ratio:
-                                    current_feed_int = 0.0
-                                elif queue_fill_ratio >= accel_trigger_ratio:
-                                    current_feed_int = feed_int
-                                else:
-                                    span = max(
-                                        1e-9, accel_trigger_ratio - final_rush_ratio
-                                    )
-                                    level = (queue_fill_ratio - final_rush_ratio) / span
-                                    current_feed_int = feed_int * max(
-                                        0.0, min(1.0, level)
-                                    )
-                                current_feed_int = min(
-                                    feed_int, current_feed_int * max(0.0, accel_factor)
-                                )
+                                current_feed_int = feed_int
+                                if queue_fill_ratio >= 0.85:
+                                    current_feed_int = feed_int * 1.8
+                                elif queue_fill_ratio <= 0.2:
+                                    current_feed_int = feed_int * max(0.6, accel_factor)
                                 if current_feed_int > 0:
                                     await asyncio.sleep(current_feed_int)
     except OSError:
@@ -2451,7 +2470,11 @@ def main_console():
             wait_for_zero_return(f"\n{C_BLUE}输入 0 返回...{C_W}")
 
         elif c == "5":
-            pid = load_state(STATE_FILE).get("pid")
+            st = load_state(STATE_FILE)
+            pid = st.get("pid")
+            st["status"] = "stopped_manual"
+            st["updated_at"] = now_ts()
+            save_state(STATE_FILE, st)
             if stop_process(pid):
                 print(f"{C_WARN}>>> 审计任务已强制停止{C_W}")
             else:
