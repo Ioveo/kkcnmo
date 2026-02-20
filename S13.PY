@@ -1957,8 +1957,8 @@ def main_console():
         total = int(s.get("total", 0))
         fed = int(s.get("fed", 0))
         feed_total = int(s.get("feed_total", 0))
-        main_bar = render_progress_bar(fed, feed_total, width=24)
-        progress_ratio = (fed / feed_total) if feed_total > 0 else 0.0
+        main_bar = render_progress_bar(done, fed, width=24)
+        progress_ratio = (done / fed) if fed > 0 else 0.0
         progress_pct = progress_ratio * 100.0
         ip_bar_width = 24
         ip_bar_fill = int(ip_bar_width * max(0.0, min(1.0, progress_ratio)))
@@ -2017,10 +2017,10 @@ def main_console():
         )
         print(
             panel_line(
-                f"{C_W}当前喂入IP:{C_CYAN}{fed}{C_W}/{feed_total} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]"
+                f"{C_W}喂入消化:{C_CYAN}{done}{C_W}/{fed} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]"
             )
         )
-        print(panel_line(f"{C_W}喂入进度条:{main_bar}"))
+        print(panel_line(f"{C_W}喂入消化进度条:{main_bar}"))
         print(
             panel_line(
                 f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}"
