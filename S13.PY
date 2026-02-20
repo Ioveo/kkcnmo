@@ -238,6 +238,15 @@ def merge_recent_lines(base_lines, recent_lines, limit=None):
 
 def classify_report_line(line):
     low = line.lower()
+    if "[XUI_FOUND]" in line:
+        return True, False, False, False
+    if "[XUI_VERIFIED]" in line:
+        return True, True, False, False
+    if "[S5_VERIFIED]" in line:
+        return False, False, True, True
+    if "[S5_FOUND]" in line:
+        return False, False, True, False
+
     is_xui_audited = (
         "[资产-面板存活]" in line
         or "asset[x-ui]" in low
@@ -834,6 +843,40 @@ def poll_zero_to_back(timeout_sec=0.5):
     return raw == "0"
 
 
+def poll_action_key(timeout_sec=0.5, keys=("0",)):
+    allowed = set(keys or ())
+    if timeout_sec <= 0:
+        return None
+
+    if os.name == "nt":
+        import msvcrt
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                if ch in allowed:
+                    return ch
+                if ch in ("\r", "\n"):
+                    continue
+            else:
+                time.sleep(0.05)
+        return None
+
+    rlist, _, _ = select.select([sys.stdin], [], [], timeout_sec)
+    if not rlist:
+        return None
+    try:
+        raw = sys.stdin.readline().strip()
+    except Exception:
+        return None
+    return raw if raw in allowed else None
+
+
 def wait_for_zero_return(prompt="输入 0 返回主菜单: "):
     while True:
         if input(prompt).strip() == "0":
@@ -1045,6 +1088,22 @@ def run_guardian(
     check_interval=20,
     min_free_mb=256.0,
 ):
+    tg_cfg = load_telegram_config()
+    tg_enabled = (
+        tg_cfg.get("enabled")
+        and bool(tg_cfg.get("bot_token"))
+        and bool(tg_cfg.get("chat_id"))
+    )
+
+    def guardian_tg_push(text):
+        if not tg_enabled:
+            return
+        ok, detail = send_telegram_message(
+            tg_cfg.get("bot_token", ""), tg_cfg.get("chat_id", ""), text
+        )
+        if not ok:
+            log_event(f"Guardian Telegram failed: {detail}")
+
     save_state(
         GUARDIAN_STATE_FILE,
         {
@@ -1063,18 +1122,26 @@ def run_guardian(
     log_event(
         f"Guardian started mode={mode} work_mode={work_mode} threads={threads} ports={ports_str} "
     )
+    guardian_tg_push(
+        f"【天才猫】\n守护已启动\n模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n线程: {threads}\n端口: {ports_str}"
+    )
     last_restart_ts = 0.0
     min_restart_gap = max(10.0, float(check_interval))
     completed_notice_logged = False
+    notified_dead_pid = None
     while True:
         mem_mb = get_available_memory_mb()
         st = load_state(STATE_FILE)
         if not is_alive(st.get("pid")):
+            dead_pid = st.get("pid")
             st_status = str(st.get("status", "")).lower()
             if st_status == "completed":
                 if not completed_notice_logged:
                     log_event(
                         "Guardian idle: last audit completed, waiting manual restart"
+                    )
+                    guardian_tg_push(
+                        "【天才猫】\n守护待机\n上次任务已完成，等待手动启动"
                     )
                     completed_notice_logged = True
                 gs = load_state(GUARDIAN_STATE_FILE)
@@ -1087,6 +1154,11 @@ def run_guardian(
             if mem_mb is None or mem_mb >= min_free_mb:
                 now = now_ts()
                 if now - last_restart_ts >= min_restart_gap:
+                    if dead_pid and dead_pid != notified_dead_pid:
+                        guardian_tg_push(
+                            f"【天才猫】\n审计进程异常退出\nPID: {dead_pid}\n状态: {st_status or '-'}\n守护准备重启"
+                        )
+                        notified_dead_pid = dead_pid
                     subprocess.Popen(
                         [
                             sys.executable,
@@ -1101,6 +1173,9 @@ def run_guardian(
                         start_new_session=True,
                     )
                     last_restart_ts = now
+                    guardian_tg_push(
+                        f"【天才猫】\n守护已重启审计进程\n模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n线程: {threads}"
+                    )
                     completed_notice_logged = False
             else:
                 log_event(
@@ -1108,6 +1183,7 @@ def run_guardian(
                 )
         else:
             completed_notice_logged = False
+            notified_dead_pid = None
         gs = load_state(GUARDIAN_STATE_FILE)
         gs["updated_at"] = now_ts()
         gs["last_free_mb"] = mem_mb
@@ -1213,7 +1289,7 @@ async def audit_xui(
                 async with state_lock:
                     state["xui_found"] += 1
             if work_mode == 1:
-                return f"[资产-面板存活] {ip}:{port} | {country} | {asn} | 协议:{proto} 路径:{path}"
+                return f"[XUI_FOUND] [资产-面板存活] {ip}:{port} | {country} | {asn} | 协议:{proto} 路径:{path}"
             continue
 
     if found_candidates and tokens:
@@ -1238,7 +1314,7 @@ async def audit_xui(
                     if check_auth_success(login_resp):
                         async with state_lock:
                             state["xui_verified"] += 1
-                        return f"[高危-后台沦陷] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
+                        return f"[XUI_VERIFIED] [高危-后台沦陷] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
         finally:
             async with state_lock:
                 state["verifying_ip_count"] = max(
@@ -1247,9 +1323,7 @@ async def audit_xui(
 
         if work_mode == 2:
             proto, _, country, asn, _ = found_candidates[0]
-            return (
-                f"[资产-面板存活] {ip}:{port} | {country} | {asn} | 字典未命中({proto})"
-            )
+            return f"[XUI_FOUND] [资产-面板存活] {ip}:{port} | {country} | {asn} | 字典未命中({proto})"
     return None
 
 
@@ -1293,7 +1367,7 @@ async def audit_socks5(
                     state["s5_found"] += 1
             country, asn = get_geo_info(ip)
             if work_mode == 1:
-                return f"[节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn}"
+                return f"[S5_FOUND] [节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn}"
 
             await close_writer(writer)
             async with conn_limiter:
@@ -1311,9 +1385,9 @@ async def audit_socks5(
                     if l7_ok:
                         async with state_lock:
                             state["s5_verified"] += 1
-                        return f"[优质-真穿透] {ip}:{port} | S5-OPEN | {country} | {asn} | RTT:{lat}ms"
+                        return f"[S5_VERIFIED] [优质-真穿透] {ip}:{port} | S5-OPEN | {country} | {asn} | RTT:{lat}ms"
                     elif work_mode in (2, 3):
-                        return f"[节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn} | 无L7能力"
+                        return f"[S5_FOUND] [节点-可连通] {ip}:{port} | S5-OPEN | {country} | {asn} | 无L7能力"
             finally:
                 await close_writer(w2)
 
@@ -1323,7 +1397,7 @@ async def audit_socks5(
                     state["s5_found"] += 1
             country, asn = get_geo_info(ip)
             if work_mode == 1:
-                return f"[资产-加密节点] {ip}:{port} | S5-AUTH | {country} | {asn}"
+                return f"[S5_FOUND] [资产-加密节点] {ip}:{port} | S5-AUTH | {country} | {asn}"
 
             await close_writer(writer)
             async with state_lock:
@@ -1332,12 +1406,12 @@ async def audit_socks5(
                 for u, p in tokens:
                     w3 = None
                     try:
+                        async with conn_limiter:
+                            r3, w3 = await asyncio.wait_for(
+                                asyncio.open_connection(ip, port), timeout=2.0
+                            )
                         if token_sem is not None:
                             async with token_sem:
-                                async with conn_limiter:
-                                    r3, w3 = await asyncio.wait_for(
-                                        asyncio.open_connection(ip, port), timeout=2.0
-                                    )
                                 w3.write(b"\x05\x01\x02")
                                 await w3.drain()
                                 await r3.read(2)
@@ -1351,10 +1425,6 @@ async def audit_socks5(
                                 await w3.drain()
                                 auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
                         else:
-                            async with conn_limiter:
-                                r3, w3 = await asyncio.wait_for(
-                                    asyncio.open_connection(ip, port), timeout=2.0
-                                )
                             w3.write(b"\x05\x01\x02")
                             await w3.drain()
                             await r3.read(2)
@@ -1381,9 +1451,9 @@ async def audit_socks5(
                             if l7_ok:
                                 async with state_lock:
                                     state["s5_verified"] += 1
-                                return f"[优质-真穿透] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
+                                return f"[S5_VERIFIED] [优质-真穿透] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | RTT:{lat}ms"
                             elif work_mode in (2, 3):
-                                return f"[节点-可连通] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
+                                return f"[S5_FOUND] [节点-可连通] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | S5-AUTH | {country} | {asn} | 无L7能力"
                     except (asyncio.TimeoutError, OSError, ValueError):
                         continue
                     finally:
@@ -1395,7 +1465,7 @@ async def audit_socks5(
                     )
 
             if work_mode in (2, 3):
-                return f"[节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
+                return f"[S5_FOUND] [节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
     except (asyncio.TimeoutError, OSError, ValueError):
         pass
     finally:
@@ -1967,11 +2037,11 @@ def main_console():
         )
 
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
-        print(f" 1) 启动审计           2) 监控面板           3) X-UI审计/验真")
-        print(f" 4) 查看日志           5) 停止审计           6) 启动守护")
-        print(f" 7) 断点续连           8) 停止守护           9) 退出系统")
-        print(f"10) Telegram推送      11) S5审计/验真      12) 进料加速策略")
-        print(f"13) 清空审计结果      14) 清空审计结果")
+        print(f" 1) 启动审计             2) 监控面板             3) X-UI审计/验真")
+        print(f" 4) 查看日志             5) 停止审计             6) 启动守护")
+        print(f" 7) 断点续连             8) 停止守护             9) 退出系统")
+        print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
+        print(f"13) 清空审计结果        14) 清空审计结果")
 
         try:
             c = timed_input(
@@ -2171,7 +2241,9 @@ def main_console():
             print(f"已扫跳过: {'启用' if rcfg.get('skip_scanned', False) else '关闭'}")
             print("1) 开启续连  2) 关闭续连  3) 清空断点")
             print("4) 开启已扫跳过  5) 关闭已扫跳过")
-            sel = input("请选择 (默认回车返回): ").strip()
+            sel = input("请选择 (输入 0 返回): ").strip()
+            if sel == "0":
+                continue
             if sel == "1":
                 rcfg["enabled"] = True
                 save_resume_config(rcfg)
@@ -2201,11 +2273,17 @@ def main_console():
             print(
                 f"当前: 触发阈值={fcfg.get('accel_trigger_ratio', 0.5):.2f} | 冲刺阈值={fcfg.get('final_rush_ratio', 0.1):.2f} | 加速系数={fcfg.get('accel_factor', 0.5):.2f}"
             )
-            print("留空表示保持当前值")
+            print("输入 0 返回主菜单，留空表示保持当前值")
 
             raw_trigger = input("触发阈值(0-1, 默认0.50): ").strip()
+            if raw_trigger == "0":
+                continue
             raw_final = input("冲刺阈值(0-1, 默认0.10): ").strip()
+            if raw_final == "0":
+                continue
             raw_factor = input("加速系数(0-1, 默认0.50, 越小越快): ").strip()
+            if raw_factor == "0":
+                continue
 
             if raw_trigger:
                 try:
@@ -2238,10 +2316,16 @@ def main_console():
             print(
                 f"当前状态: {'启用' if cfg.get('enabled') else '关闭'} | 条件: {telegram_condition_label(cfg.get('condition_mode', 2))} | 定时: {cfg.get('interval_minutes', 0)} 分钟 | 验真阈值: {cfg.get('verified_threshold', 5)}"
             )
-            print("留空表示保持当前值")
+            print("输入 0 返回主菜单，留空表示保持当前值")
             token = input("Bot Token: ").strip()
+            if token == "0":
+                continue
             chat_id = input("Chat ID: ").strip()
+            if chat_id == "0":
+                continue
             en_raw = input("启用推送? (y/n, 默认保持): ").strip().lower()
+            if en_raw == "0":
+                continue
             interval_raw = input("定时推送间隔分钟 (0=关闭, 默认保持): ").strip()
             cond_raw = input(
                 "条件推送 (0关闭/1发现即推/2仅验真/3发现+验真/4完成或验真>=阈值(单次), 默认保持): "
@@ -2345,6 +2429,8 @@ def main_console():
 
         elif c in ("13", "14"):
             sure = input("确认清空审计结果历史? (y/n): ").strip().lower()
+            if sure == "0":
+                continue
             if sure == "y":
                 clear_report_history()
                 print(f"{C_SUCC}>>> 审计结果历史已清空{C_W}")
