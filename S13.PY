@@ -57,7 +57,8 @@ ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
 EXPOSE_SECRET_IN_REPORT = True
-MAX_EXPANDED_TARGETS_PER_ENTRY = 65536
+# 不再限制单个网段展开上限，改为流式逐个投喂
+MAX_EXPANDED_TARGETS_PER_ENTRY = None
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
@@ -727,21 +728,18 @@ def parse_ports(raw):
     return sorted(set(ports))
 
 
-def expand_target_entry(raw_target, max_items=MAX_EXPANDED_TARGETS_PER_ENTRY):
+def iter_expanded_targets(raw_target):
     target = raw_target.strip()
     if not target:
-        return [target], False
+        return
 
     if "/" in target:
         try:
             net = ipaddress.ip_network(target, strict=False)
-            out = []
             iterator = net.hosts() if net.num_addresses > 1 else [net.network_address]
-            for idx, ip_obj in enumerate(iterator):
-                if idx >= max_items:
-                    return out, True
-                out.append(str(ip_obj))
-            return out, False
+            for ip_obj in iterator:
+                yield str(ip_obj)
+            return
         except ValueError:
             pass
 
@@ -755,11 +753,9 @@ def expand_target_entry(raw_target, max_items=MAX_EXPANDED_TARGETS_PER_ENTRY):
             end_ip = ipaddress.ip_address(right)
             if start_ip.version == end_ip.version and int(end_ip) >= int(start_ip):
                 span = int(end_ip) - int(start_ip) + 1
-                count = min(span, max_items)
-                out = [
-                    str(ipaddress.ip_address(int(start_ip) + i)) for i in range(count)
-                ]
-                return out, span > max_items
+                for i in range(span):
+                    yield str(ipaddress.ip_address(int(start_ip) + i))
+                return
         except ValueError:
             pass
 
@@ -772,13 +768,13 @@ def expand_target_entry(raw_target, max_items=MAX_EXPANDED_TARGETS_PER_ENTRY):
                 if 0 <= end_last <= 255 and end_last >= start_last:
                     base = ".".join(parts[:3])
                     span = end_last - start_last + 1
-                    count = min(span, max_items)
-                    out = [f"{base}.{start_last + i}" for i in range(count)]
-                    return out, span > max_items
+                    for i in range(span):
+                        yield f"{base}.{start_last + i}"
+                    return
         except ValueError:
             pass
 
-    return [target], False
+    yield target
 
 
 def prompt_int(msg, default, min_value=None, max_value=None):
@@ -1931,8 +1927,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         return
 
     seen_targets = set()
-    all_targets = []
     skipped_by_resume = 0
+    skipped_by_history = 0
+    scanned_ips = collect_reported_ips() if skip_scanned_enabled else set()
     try:
         for node_file in node_files:
             with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -1941,37 +1938,39 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     if not line or line.startswith("#"):
                         continue
                     for raw_target in line.split():
-                        expanded, truncated = expand_target_entry(raw_target)
-                        if truncated:
-                            log_event(
-                                f"Target entry truncated: {raw_target} -> first {MAX_EXPANDED_TARGETS_PER_ENTRY}"
-                            )
-                        for target in expanded:
+                        for target in iter_expanded_targets(raw_target):
                             if target in seen_targets:
                                 continue
                             seen_targets.add(target)
-                            all_targets.append(target)
+                            async with state_lock:
+                                state["total"] += 1
+                                state["current"] = f"Parsing target -> {target}"
+
+                            if resume_enabled and target in done_targets:
+                                skipped_by_resume += 1
+                                async with state_lock:
+                                    state["done"] += 1
+                                continue
+
+                            if skip_scanned_enabled and target in scanned_ips:
+                                skipped_by_history += 1
+                                async with state_lock:
+                                    state["done"] += 1
+                                continue
+
+                            async with state_lock:
+                                state["feed_total"] += 1
+                                state["fed"] += 1
+                                state["current"] = f"Feeding target -> {target}"
+
+                            await q.put(target)
+                            if feed_int > 0:
+                                await asyncio.sleep(feed_int)
     except OSError:
         pass
 
-    async with state_lock:
-        state["total"] = len(all_targets)
-
-    skipped_by_history = 0
-    scanned_ips = collect_reported_ips() if skip_scanned_enabled else set()
-    pending_targets = []
-    for target in all_targets:
-        if resume_enabled and target in done_targets:
-            skipped_by_resume += 1
-            continue
-        if skip_scanned_enabled and target in scanned_ips:
-            skipped_by_history += 1
-            continue
-        pending_targets.append(target)
-
     if skipped_by_resume > 0 or skipped_by_history > 0:
         async with state_lock:
-            state["done"] += skipped_by_resume + skipped_by_history
             state["current"] = (
                 f"Skip -> resume:{skipped_by_resume} history:{skipped_by_history}"
             )
@@ -1979,24 +1978,6 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             log_event(f"Resume restored {skipped_by_resume} completed targets")
         if skipped_by_history > 0:
             log_event(f"History skipped {skipped_by_history} scanned targets")
-
-    pending_total = len(pending_targets)
-    async with state_lock:
-        state["feed_total"] = pending_total
-    for idx, target in enumerate(pending_targets, start=1):
-        async with state_lock:
-            state["current"] = f"Feeding target -> {target}"
-            state["fed"] = idx
-        await q.put(target)
-        if feed_int > 0:
-            remaining_ratio = (pending_total - idx) / max(1, pending_total)
-            current_feed_int = feed_int
-            if remaining_ratio <= final_rush_ratio:
-                current_feed_int = 0.0
-            elif remaining_ratio <= accel_trigger_ratio:
-                current_feed_int = feed_int * accel_factor
-            if current_feed_int > 0:
-                await asyncio.sleep(current_feed_int)
 
     for _ in range(threads):
         await q.put(None)
