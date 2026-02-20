@@ -11,6 +11,7 @@ import subprocess
 import ctypes
 import ssl
 import re
+import shutil
 import unicodedata
 import select
 import traceback
@@ -37,6 +38,7 @@ RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
 FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
+RUN_LOCK_FILE = os.path.join(BASE_DIR, "audit_runner.lock")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_VERIFIED_EVENTS_BYTES = 4 * 1024 * 1024
@@ -45,6 +47,8 @@ REPORT_BACKUPS = 3
 VERIFIED_EVENTS_BACKUPS = 2
 STATE_FLUSH_INTERVAL = 1.0
 CHECKPOINT_FLUSH_INTERVAL = 3.0
+CHECKPOINT_GROWTH_STEP = 500
+CHECKPOINT_MAX_IDLE_FLUSH_SEC = 30.0
 MAX_SOCKET_CONCURRENCY = 600
 FEED_ACCEL_TRIGGER_RATIO = 0.5
 FEED_FINAL_RUSH_RATIO = 0.1
@@ -709,6 +713,56 @@ def stop_process(pid):
         return False
 
 
+def _read_lock_pid(lock_file):
+    try:
+        with open(lock_file, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return int(data.get("pid", 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def acquire_run_lock(lock_file=RUN_LOCK_FILE):
+    payload = {
+        "pid": os.getpid(),
+        "created_at": now_ts(),
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+
+    for _ in range(2):
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, text.encode("utf-8", errors="ignore"))
+            finally:
+                os.close(fd)
+            return True, 0
+        except FileExistsError:
+            holder_pid = _read_lock_pid(lock_file)
+            if holder_pid > 0 and is_alive(holder_pid):
+                return False, holder_pid
+            try:
+                os.remove(lock_file)
+            except OSError:
+                return False, holder_pid
+        except OSError:
+            return False, 0
+
+    holder_pid = _read_lock_pid(lock_file)
+    return False, holder_pid
+
+
+def release_run_lock(lock_file=RUN_LOCK_FILE):
+    holder_pid = _read_lock_pid(lock_file)
+    if holder_pid not in (0, os.getpid()):
+        return
+    try:
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+    except OSError:
+        pass
+
+
 def parse_ports(raw):
     ports = []
     try:
@@ -1346,8 +1400,12 @@ async def audit_xui(
             continue
 
     if found_candidates and tokens:
+        verify_state_snapshot = None
         async with state_lock:
             state["verifying_ip_count"] = state.get("verifying_ip_count", 0) + 1
+            verify_state_snapshot = dict(state)
+        if verify_state_snapshot is not None:
+            save_state(STATE_FILE, verify_state_snapshot)
         try:
             for proto, use_ssl, country, asn, login_path in found_candidates:
                 for u, p in tokens:
@@ -1369,10 +1427,14 @@ async def audit_xui(
                             state["xui_verified"] += 1
                         return f"[XUI_VERIFIED] [高危-后台沦陷] {ip}:{port} | 账号:{u} | 密码:{mask_secret(p)} | {country} | {asn} | 登录成功({proto})"
         finally:
+            verify_state_snapshot = None
             async with state_lock:
                 state["verifying_ip_count"] = max(
                     0, state.get("verifying_ip_count", 0) - 1
                 )
+                verify_state_snapshot = dict(state)
+            if verify_state_snapshot is not None:
+                save_state(STATE_FILE, verify_state_snapshot)
 
         if work_mode == 2:
             proto, _, country, asn, _ = found_candidates[0]
@@ -1453,8 +1515,12 @@ async def audit_socks5(
                 return f"[S5_FOUND] [资产-加密节点] {ip}:{port} | S5-AUTH | {country} | {asn}"
 
             await close_writer(writer)
+            verify_state_snapshot = None
             async with state_lock:
                 state["verifying_ip_count"] = state.get("verifying_ip_count", 0) + 1
+                verify_state_snapshot = dict(state)
+            if verify_state_snapshot is not None:
+                save_state(STATE_FILE, verify_state_snapshot)
             try:
                 for u, p in tokens:
                     w3 = None
@@ -1525,10 +1591,14 @@ async def audit_socks5(
                     finally:
                         await close_writer(w3)
             finally:
+                verify_state_snapshot = None
                 async with state_lock:
                     state["verifying_ip_count"] = max(
                         0, state.get("verifying_ip_count", 0) - 1
                     )
+                    verify_state_snapshot = dict(state)
+                if verify_state_snapshot is not None:
+                    save_state(STATE_FILE, verify_state_snapshot)
 
             if work_mode in (2, 3):
                 return f"[S5_FOUND] [节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
@@ -1546,18 +1616,28 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state = {
         "status": "running",
         "pid": os.getpid(),
+        "mode": mode,
         "total": 0,
         "done": 0,
         "fed": 0,
         "feed_total": 0,
+        "feed_interval": feed_int,
         "xui_found": 0,
         "xui_verified": 0,
         "s5_found": 0,
         "s5_verified": 0,
         "verifying_ip_count": 0,
         "active_workers": 0,
+        "queue_size": 0,
+        "tokens_loaded": 0,
+        "current_ip": "-",
+        "current_service": "-",
+        "current_port": "-",
         "work_mode": work_mode,
         "recent": [],
+        "skipped_resume": 0,
+        "skipped_history": 0,
+        "feeding_done": False,
         "started_at": now_ts(),
         "current": "Initializing...",
     }
@@ -1601,6 +1681,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     last_quick_persist_ts = 0.0
     special_or_sent = False
     notify_tasks = set()
+    last_checkpoint_saved_size = len(done_targets)
+    last_checkpoint_saved_ts = now_ts()
 
     q = asyncio.Queue(maxsize=max(threads * 4, 4096))
     token_sem = asyncio.Semaphore(max(1, threads // 2))
@@ -1621,6 +1703,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     else:
         xui_ports = []
         s5_ports = list(ports)
+
+    state["xui_ports_total"] = len(xui_ports)
+    state["s5_ports_total"] = len(s5_ports)
 
     async def push_telegram(text):
         if not tg_enabled:
@@ -1678,6 +1763,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
     async def flush_state_loop():
         nonlocal last_interval_push_ts, last_daily_push_date
+        nonlocal last_checkpoint_saved_size, last_checkpoint_saved_ts
         last_checkpoint_ts = 0.0
         while not flush_stop.is_set():
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
@@ -1691,15 +1777,31 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             checkpoint_targets = None
             checkpoint_done = 0
             checkpoint_total = 0
+            checkpoint_size = 0
             async with state_lock:
+                state["queue_size"] = q.qsize()
                 state_snapshot = dict(state)
                 if (
                     resume_enabled
                     and now - last_checkpoint_ts >= CHECKPOINT_FLUSH_INTERVAL
                 ):
-                    checkpoint_targets = list(done_targets)
-                    checkpoint_done = state.get("done", 0)
-                    checkpoint_total = state.get("total", 0)
+                    done_size = len(done_targets)
+                    done_now = state.get("done", 0)
+                    total_now = state.get("total", 0)
+                    reached_growth_step = (
+                        done_size - last_checkpoint_saved_size
+                    ) >= CHECKPOINT_GROWTH_STEP
+                    reached_idle_flush = (
+                        done_size != last_checkpoint_saved_size
+                        and now - last_checkpoint_saved_ts
+                        >= CHECKPOINT_MAX_IDLE_FLUSH_SEC
+                    )
+                    about_to_finish = done_now >= total_now and done_size > 0
+                    if reached_growth_step or reached_idle_flush or about_to_finish:
+                        checkpoint_targets = list(done_targets)
+                        checkpoint_done = done_now
+                        checkpoint_total = total_now
+                        checkpoint_size = done_size
                     last_checkpoint_ts = now
                 if (
                     tg_enabled
@@ -1732,11 +1834,13 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     {
                         "session_key": session_key,
                         "updated_at": now,
-                        "done_targets": sorted(checkpoint_targets),
+                        "done_targets": checkpoint_targets,
                         "done": checkpoint_done,
                         "total": checkpoint_total,
                     },
                 )
+                last_checkpoint_saved_size = checkpoint_size
+                last_checkpoint_saved_ts = now
             if should_send_interval:
                 last_interval_push_ts = now
                 schedule_telegram(build_interval_message(snapshot, recent_lines))
@@ -1778,6 +1882,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 l = l.strip()
                 if l:
                     tokens.append(l.split(":", 1) if ":" in l else ["admin", l])
+    async with state_lock:
+        state["tokens_loaded"] = len(tokens)
 
     async def worker():
         nonlocal special_or_sent, last_quick_persist_ts
@@ -1790,6 +1896,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             try:
                 async with state_lock:
                     state["current"] = f"Auditing -> {ip}"
+                    state["current_ip"] = ip
                     state["active_workers"] = state.get("active_workers", 0) + 1
                     active_started = True
 
@@ -1826,6 +1933,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
                 if mode in (1, 3):
                     for p in xui_ports:
+                        async with state_lock:
+                            state["current_service"] = "XUI"
+                            state["current_port"] = str(p)
                         x_r = await audit_xui(
                             ip,
                             p,
@@ -1842,6 +1952,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
 
                 if mode in (2, 3):
                     for p in s5_ports:
+                        async with state_lock:
+                            state["current_service"] = "S5"
+                            state["current_port"] = str(p)
                         s_r = await audit_socks5(
                             ip,
                             p,
@@ -1856,7 +1969,6 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             await handle_found_results([s_r])
                             break
                 quick_state_snapshot = None
-                quick_cp_snapshot = None
                 async with state_lock:
                     state["done"] += 1
                     state["current"] = f"Completed -> {ip}"
@@ -1866,14 +1978,6 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     if now - last_quick_persist_ts >= 1.0:
                         last_quick_persist_ts = now
                         quick_state_snapshot = dict(state)
-                        if resume_enabled:
-                            quick_cp_snapshot = {
-                                "session_key": session_key,
-                                "updated_at": now,
-                                "done_targets": sorted(done_targets),
-                                "done": state.get("done", 0),
-                                "total": state.get("total", 0),
-                            }
                     need_special_or_push = (
                         tg_enabled
                         and tg_condition_mode == 4
@@ -1899,8 +2003,6 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         special_recent = []
                 if quick_state_snapshot is not None:
                     save_state(STATE_FILE, quick_state_snapshot)
-                if quick_cp_snapshot is not None:
-                    save_state(CHECKPOINT_FILE, quick_cp_snapshot)
                 if special_snapshot is not None:
                     schedule_telegram(
                         build_interval_message(special_snapshot, special_recent)
@@ -1950,12 +2052,14 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                                 skipped_by_resume += 1
                                 async with state_lock:
                                     state["done"] += 1
+                                    state["skipped_resume"] += 1
                                 continue
 
                             if skip_scanned_enabled and target in scanned_ips:
                                 skipped_by_history += 1
                                 async with state_lock:
                                     state["done"] += 1
+                                    state["skipped_history"] += 1
                                 continue
 
                             async with state_lock:
@@ -1968,6 +2072,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                                 await asyncio.sleep(feed_int)
     except OSError:
         pass
+
+    async with state_lock:
+        state["feeding_done"] = True
 
     if skipped_by_resume > 0 or skipped_by_history > 0:
         async with state_lock:
@@ -2017,6 +2124,7 @@ def main_console():
     spin_idx = 0
     panel_inner = 74
     panel_border = C_BLUE
+    panel_rows = 8
 
     def visible_width(text):
         clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -2030,9 +2138,46 @@ def main_console():
                 width += 1
         return width
 
-    def panel_line(text):
-        pad = max(0, panel_inner - 1 - visible_width(text))
+    def panel_line(text, inner=panel_inner):
+        pad = max(0, inner - 1 - visible_width(text))
         return f"{panel_border}┃ {text}{' ' * pad}{panel_border}┃{C_W}"
+
+    def build_panel(title, lines, inner=panel_inner, rows=panel_rows):
+        top = f"{panel_border}┏{'━' * inner}┓{C_W}"
+        sep = f"{panel_border}┣{'━' * inner}┫{C_W}"
+        bottom = f"{panel_border}┗{'━' * inner}┛{C_W}"
+        out = [top, panel_line(title, inner), sep]
+        body = list(lines)[:rows]
+        if len(body) < rows:
+            body.extend([""] * (rows - len(body)))
+        for line in body:
+            out.append(panel_line(line, inner))
+        out.append(bottom)
+        return out
+
+    def render_dual_panels(left_title, left_lines, right_title, right_lines):
+        term_width = shutil.get_terminal_size((160, 40)).columns
+        gap = "  "
+        single_w = panel_inner + 2
+        need_w = single_w * 2 + len(gap)
+        if term_width < need_w:
+            for ln in build_panel(left_title, left_lines):
+                print(ln)
+            print()
+            for ln in build_panel(right_title, right_lines):
+                print(ln)
+            return
+        left_panel = build_panel(left_title, left_lines)
+        right_panel = build_panel(right_title, right_lines)
+        for l, r in zip(left_panel, right_panel):
+            print(l + gap + r)
+
+    def fmt_dur(sec):
+        sec = max(0, int(sec))
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -2051,8 +2196,14 @@ def main_console():
         total = int(s.get("total", 0))
         fed = int(s.get("fed", 0))
         feed_total = int(s.get("feed_total", 0))
-        main_bar = render_progress_bar(done, fed, width=24)
-        progress_ratio = (done / fed) if fed > 0 else 0.0
+        skipped_resume = int(s.get("skipped_resume", 0))
+        skipped_history = int(s.get("skipped_history", 0))
+        skipped_total = skipped_resume + skipped_history
+        worker_done = max(0, done - skipped_total)
+        parse_done = bool(s.get("feeding_done", False))
+        parse_bar = render_progress_bar(done, total, width=24)
+        worker_bar = render_progress_bar(worker_done, feed_total, width=24)
+        progress_ratio = (worker_done / feed_total) if feed_total > 0 else 0.0
         progress_pct = progress_ratio * 100.0
         ip_bar_width = 24
         ip_bar_fill = int(ip_bar_width * max(0.0, min(1.0, progress_ratio)))
@@ -2090,44 +2241,46 @@ def main_console():
             and tg_cfg.get("chat_id")
             else f"{C_DIM}OFF{C_W}"
         )
+        mode_text = mode_label(s.get("mode", 3))
+        queue_size = int(s.get("queue_size", 0))
+        tokens_loaded = int(s.get("tokens_loaded", 0))
+        current_ip = str(s.get("current_ip", "-"))
+        current_service = str(s.get("current_service", "-"))
+        current_port = str(s.get("current_port", "-"))
+        xui_ports_total = int(s.get("xui_ports_total", 0))
+        s5_ports_total = int(s.get("s5_ports_total", 0))
+        feed_interval = float(s.get("feed_interval", 0.0))
+        run_status = str(s.get("status", "idle"))
+        started_ts = float(s.get("started_at", now_ts()) or now_ts())
+        uptime = fmt_dur(now_ts() - started_ts)
 
-        # 极光面板头部
-        print(
-            f"{panel_border}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
-        )
-        print(panel_line(f"SAIA MASTER CONSOLE v23.5 | 旗舰穿透版"))
-        print(
-            f"{panel_border}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
-        )
-        print(
-            panel_line(
-                f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}"
-            )
-        )
-        print(
-            panel_line(
-                f"{C_W}审计:{C_CYAN}{done}{C_W}/{total} {panel_border}| {C_W}喂入:{C_CYAN}{fed}{C_W}/{feed_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}"
-            )
-        )
-        print(
-            panel_line(
-                f"{C_W}喂入消化:{C_CYAN}{done}{C_W}/{fed} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]"
-            )
-        )
-        print(panel_line(f"{C_W}喂入消化进度条:{main_bar}"))
-        print(
-            panel_line(
-                f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_WARN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_SUCC}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}"
-            )
-        )
-        print(
-            panel_line(
-                f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}"
-            )
-        )
-        print(panel_line(f"{C_W}当前:{C_DIM}{current}{C_W}"))
-        print(
-            f"{panel_border}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
+        left_lines = [
+            f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}",
+            f"{C_W}解析:{C_CYAN}{total}{C_W} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{feed_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}",
+            f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{feed_total} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]",
+            f"{C_W}全体进度(含跳过):{parse_bar}  跳过:{C_CYAN}{skipped_total}{C_W}",
+            f"{C_W}投喂进度条:{worker_bar}",
+            f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_CYAN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_CYAN}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}",
+            f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}",
+            f"{C_W}当前:{C_DIM}{current}{C_W}",
+        ]
+
+        right_lines = [
+            f"{C_W}状态:{C_CYAN}{run_status}{C_W} {panel_border}| {C_W}模式:{C_CYAN}{mode_text}{C_W} {panel_border}| {C_W}运行:{C_CYAN}{uptime}{C_W}",
+            f"{C_W}PID:{C_CYAN}{int(s.get('pid', 0) or 0)}{C_W} {panel_border}| {C_W}队列深度:{C_CYAN}{queue_size}{C_W} {panel_border}| {C_W}喂入间隔:{C_CYAN}{feed_interval:.3f}s{C_W}",
+            f"{C_W}扫描目标 IP:{C_CYAN}{current_ip}{C_W}",
+            f"{C_W}扫描服务:{C_CYAN}{current_service}{C_W} {panel_border}| {C_W}当前端口:{C_CYAN}{current_port}{C_W}",
+            f"{C_W}端口装载 XUI:{C_CYAN}{xui_ports_total}{C_W} {panel_border}| {C_W}S5:{C_CYAN}{s5_ports_total}{C_W}",
+            f"{C_W}字典口令加载:{C_CYAN}{tokens_loaded}{C_W} 条",
+            f"{C_W}跳过统计 断点:{C_CYAN}{skipped_resume}{C_W} {panel_border}| 历史:{C_CYAN}{skipped_history}{C_W}",
+            f"{C_W}连接占用 Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit}",
+        ]
+
+        render_dual_panels(
+            "SAIA MASTER CONSOLE v23.5 | 旗舰穿透版",
+            left_lines,
+            "MONITOR DETAIL | 运行细节",
+            right_lines,
         )
 
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
@@ -2150,6 +2303,13 @@ def main_console():
             continue
 
         if c == "1":
+            running_pid = load_state(STATE_FILE).get("pid")
+            if is_alive(running_pid):
+                print(
+                    f"{C_WARN}>>> 已有审计进程运行中(PID {running_pid})，请先停止再启动{C_W}"
+                )
+                time.sleep(1.2)
+                continue
             print(f"\n{C_CYAN}>>> 配置审计参数{C_W}")
             m = prompt_int(
                 "模式 (1.XUI / 2.S5 / 3.全能): ", default=3, min_value=1, max_value=3
@@ -2538,6 +2698,11 @@ if __name__ == "__main__":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 7:
             raise SystemExit("参数不足")
+        got_lock, holder_pid = acquire_run_lock()
+        if not got_lock:
+            if holder_pid > 0:
+                raise SystemExit(f"已有审计进程运行中 (PID {holder_pid})")
+            raise SystemExit("已有审计进程运行中")
         mode, work_mode, threads = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
         ports, feed_int = parse_ports(sys.argv[5]), float(sys.argv[6])
         if (
@@ -2555,6 +2720,8 @@ if __name__ == "__main__":
         except Exception:
             log_exception("fatal crash in run mode")
             raise
+        finally:
+            release_run_lock()
     elif len(sys.argv) > 1 and sys.argv[1] == "guardian":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 6:
