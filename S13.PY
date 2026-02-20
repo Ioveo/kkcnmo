@@ -16,7 +16,7 @@ import select
 import traceback
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ============================================================
 #  SYSTEM ASSET INTEGRITY AUDITOR (SAIA) v23.5 - 极光UI显密版
@@ -36,25 +36,29 @@ TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
 FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
+CHECKPOINT_DONE_FILE = os.path.join(BASE_DIR, "audit_checkpoint_done.log")
+VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
+MAX_VERIFIED_EVENTS_BYTES = 4 * 1024 * 1024
 LOG_BACKUPS = 5
 REPORT_BACKUPS = 3
+VERIFIED_EVENTS_BACKUPS = 2
 STATE_FLUSH_INTERVAL = 1.0
 CHECKPOINT_FLUSH_INTERVAL = 3.0
-MAX_SOCKET_CONCURRENCY = 600
+MAX_SOCKET_CONCURRENCY = 2000
 FEED_ACCEL_TRIGGER_RATIO = 0.5
 FEED_FINAL_RUSH_RATIO = 0.1
 FEED_ACCEL_FACTOR = 0.5
 ADAPT_CHECK_INTERVAL = 2.0
 ADAPT_MIN_CONCURRENCY = 100
-ADAPT_MAX_CONCURRENCY = 1000
+ADAPT_MAX_CONCURRENCY = 2000
 ADAPT_STEP_UP = 50
 ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
 EXPOSE_SECRET_IN_REPORT = True
-MAX_EXPANDED_TARGETS_PER_ENTRY = 65536
+MAX_EXPANDED_TARGETS_PER_ENTRY = 20000000
 DEFAULT_XUI_PORTS = "54321,2053"
 DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
@@ -159,6 +163,58 @@ def log_exception(context):
         MAX_LOG_BYTES,
         LOG_BACKUPS,
     )
+
+
+def record_verified_event(line):
+    event = {
+        "ts": now_ts(),
+        "line": str(line or ""),
+    }
+    append_rotating(
+        VERIFIED_EVENTS_FILE,
+        json.dumps(event, ensure_ascii=False) + "\n",
+        MAX_VERIFIED_EVENTS_BYTES,
+        VERIFIED_EVENTS_BACKUPS,
+    )
+
+
+def collect_verified_last_24h(now_dt=None):
+    if now_dt is None:
+        now_dt = datetime.now()
+    cutoff_ts = (now_dt - timedelta(hours=24)).timestamp()
+    xui_lines, s5_lines = [], []
+
+    paths = []
+    for i in range(VERIFIED_EVENTS_BACKUPS, 0, -1):
+        p = f"{VERIFIED_EVENTS_FILE}.{i}"
+        if os.path.exists(p):
+            paths.append(p)
+    if os.path.exists(VERIFIED_EVENTS_FILE):
+        paths.append(VERIFIED_EVENTS_FILE)
+
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                        ts = float(obj.get("ts", 0))
+                        line = str(obj.get("line", ""))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if ts < cutoff_ts or not line:
+                        continue
+                    if "[高危-后台沦陷]" in line or "[XUI_VERIFIED]" in line:
+                        xui_lines.append(line)
+                    if "[优质-真穿透]" in line or "[S5_VERIFIED]" in line:
+                        s5_lines.append(line)
+        except OSError:
+            continue
+
+    return xui_lines, s5_lines
 
 
 # --- 用这段代码替换原有的 read_last_lines 函数 ---
@@ -507,6 +563,41 @@ def clear_checkpoint():
             os.remove(CHECKPOINT_FILE)
     except OSError:
         pass
+    try:
+        if os.path.exists(CHECKPOINT_DONE_FILE):
+            os.remove(CHECKPOINT_DONE_FILE)
+    except OSError:
+        pass
+
+
+def load_checkpoint_done_targets(session_key):
+    done = set()
+    if not session_key or not os.path.exists(CHECKPOINT_DONE_FILE):
+        return done
+    try:
+        with open(CHECKPOINT_DONE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                raw = raw.rstrip("\n")
+                if not raw or "\t" not in raw:
+                    continue
+                sk, target = raw.split("\t", 1)
+                if sk == session_key and target:
+                    done.add(target)
+    except OSError:
+        pass
+    return done
+
+
+def append_checkpoint_done_targets(session_key, targets):
+    if not session_key or not targets:
+        return
+    try:
+        with open(CHECKPOINT_DONE_FILE, "a", encoding="utf-8") as f:
+            for target in targets:
+                if target:
+                    f.write(f"{session_key}\t{target}\n")
+    except OSError:
+        pass
 
 
 def load_telegram_config():
@@ -724,6 +815,83 @@ def expand_target_entry(raw_target, max_items=MAX_EXPANDED_TARGETS_PER_ENTRY):
             pass
 
     return [target], False
+
+
+def expand_target_entry_iter(raw_target, max_items=MAX_EXPANDED_TARGETS_PER_ENTRY):
+    target = raw_target.strip()
+    if not target:
+        return iter(()), False
+
+    if "/" in target:
+        try:
+            net = ipaddress.ip_network(target, strict=False)
+            if net.num_addresses <= 1:
+                return iter((str(net.network_address),)), False
+
+            if isinstance(net, ipaddress.IPv4Network):
+                if net.prefixlen <= 30:
+                    host_total = max(0, int(net.num_addresses) - 2)
+                elif net.prefixlen == 31:
+                    host_total = 2
+                else:
+                    host_total = 1
+            else:
+                host_total = int(net.num_addresses)
+
+            truncated = host_total > max_items
+
+            def _cidr_gen():
+                for idx, ip_obj in enumerate(net.hosts()):
+                    if idx >= max_items:
+                        break
+                    yield str(ip_obj)
+
+            return _cidr_gen(), truncated
+        except ValueError:
+            pass
+
+    if "-" in target:
+        left, right = target.split("-", 1)
+        left = left.strip()
+        right = right.strip()
+
+        try:
+            start_ip = ipaddress.ip_address(left)
+            end_ip = ipaddress.ip_address(right)
+            if start_ip.version == end_ip.version and int(end_ip) >= int(start_ip):
+                span = int(end_ip) - int(start_ip) + 1
+                count = min(span, max_items)
+                truncated = span > max_items
+
+                def _range_gen():
+                    for i in range(count):
+                        yield str(ipaddress.ip_address(int(start_ip) + i))
+
+                return _range_gen(), truncated
+        except ValueError:
+            pass
+
+        try:
+            start_ip = ipaddress.ip_address(left)
+            if start_ip.version == 4 and right.isdigit():
+                parts = left.split(".")
+                start_last = int(parts[-1])
+                end_last = int(right)
+                if 0 <= end_last <= 255 and end_last >= start_last:
+                    base = ".".join(parts[:3])
+                    span = end_last - start_last + 1
+                    count = min(span, max_items)
+                    truncated = span > max_items
+
+                    def _last_octet_gen():
+                        for i in range(count):
+                            yield f"{base}.{start_last + i}"
+
+                    return _last_octet_gen(), truncated
+        except ValueError:
+            pass
+
+    return iter((target,)), False
 
 
 def prompt_int(msg, default, min_value=None, max_value=None):
@@ -1509,12 +1677,15 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     accel_factor = float(feed_cfg.get("accel_factor", FEED_ACCEL_FACTOR))
     session_key = f"{mode}|{work_mode}|{','.join(str(p) for p in ports)}"
     done_targets = set()
+    checkpoint_pending_targets = []
     if resume_enabled:
         cp = load_state(CHECKPOINT_FILE)
         if cp.get("session_key") == session_key:
-            raw_done = cp.get("done_targets", [])
-            if isinstance(raw_done, list):
-                done_targets = {str(x) for x in raw_done if str(x).strip()}
+            done_targets = load_checkpoint_done_targets(session_key)
+            if not done_targets:
+                raw_done = cp.get("done_targets", [])
+                if isinstance(raw_done, list):
+                    done_targets = {str(x) for x in raw_done if str(x).strip()}
     state["resume_enabled"] = resume_enabled
     state["skip_scanned_enabled"] = skip_scanned_enabled
     state["resume_restored"] = len(done_targets)
@@ -1531,6 +1702,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     tg_condition_mode = int(tg_cfg.get("condition_mode", 2))
     tg_verified_threshold = int(tg_cfg.get("verified_threshold", 5))
     last_interval_push_ts = 0.0
+    last_daily_push_date = ""
     last_quick_persist_ts = 0.0
     special_or_sent = False
     notify_tasks = set()
@@ -1591,27 +1763,50 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             f"最新:\n" + ("\n".join(recent_lines) if recent_lines else "-")
         )
 
+    def build_daily_verified_message(now_dt):
+        xui_verified_24h, s5_verified_24h = collect_verified_last_24h(now_dt)
+        xui_fmt = [format_result_line(x, "xui") for x in xui_verified_24h]
+        s5_fmt = [format_result_line(x, "socks5") for x in s5_verified_24h]
+        lines = []
+        lines.append("【天才猫】")
+        lines.append("每日验真汇总(近24小时)")
+        lines.append(f"时间: {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"XUI 验真成功: {len(xui_fmt)}")
+        lines.append(f"S5 验真成功: {len(s5_fmt)}")
+        lines.append("")
+        lines.append("XUI 明细:")
+        lines.extend(xui_fmt[-20:] if xui_fmt else ["-"])
+        lines.append("")
+        lines.append("S5 明细:")
+        lines.extend(s5_fmt[-20:] if s5_fmt else ["-"])
+        return "\n".join(lines)
+
     async def flush_state_loop():
-        nonlocal last_interval_push_ts
+        nonlocal last_interval_push_ts, last_daily_push_date
         last_checkpoint_ts = 0.0
         while not flush_stop.is_set():
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
             now = now_ts()
+            now_dt = datetime.now()
             should_send_interval = False
+            should_send_daily = False
             snapshot = None
             recent_lines = []
+            checkpoint_batch = []
             async with state_lock:
                 save_state(STATE_FILE, state)
                 if (
                     resume_enabled
                     and now - last_checkpoint_ts >= CHECKPOINT_FLUSH_INTERVAL
                 ):
+                    if checkpoint_pending_targets:
+                        checkpoint_batch = list(checkpoint_pending_targets)
+                        checkpoint_pending_targets.clear()
                     save_state(
                         CHECKPOINT_FILE,
                         {
                             "session_key": session_key,
                             "updated_at": now,
-                            "done_targets": sorted(done_targets),
                             "done": state.get("done", 0),
                             "total": state.get("total", 0),
                         },
@@ -1633,9 +1828,21 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         "s5_verified": state.get("s5_verified", 0),
                     }
                     recent_lines = list(state.get("recent", []))[-5:]
+                if (
+                    tg_enabled
+                    and now_dt.hour == 9
+                    and now_dt.minute < 2
+                    and last_daily_push_date != now_dt.strftime("%Y-%m-%d")
+                ):
+                    should_send_daily = True
             if should_send_interval:
                 last_interval_push_ts = now
                 schedule_telegram(build_interval_message(snapshot, recent_lines))
+            if should_send_daily:
+                last_daily_push_date = now_dt.strftime("%Y-%m-%d")
+                schedule_telegram(build_daily_verified_message(now_dt))
+            if checkpoint_batch:
+                append_checkpoint_done_targets(session_key, checkpoint_batch)
 
     async def adaptive_conn_loop():
         current_limit = socket_limit
@@ -1699,6 +1906,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             MAX_REPORT_BYTES,
                             REPORT_BACKUPS,
                         )
+                        if ("[高危-后台沦陷]" in r) or ("[优质-真穿透]" in r):
+                            record_verified_event(r)
                     if tg_enabled and tg_condition_mode in (1, 2, 3):
                         matched = [r for r in found_res if should_push_condition(r)]
                         if matched:
@@ -1753,6 +1962,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     state["current"] = f"Completed -> {ip}"
                     if resume_enabled:
                         done_targets.add(ip)
+                        checkpoint_pending_targets.append(ip)
                     now = now_ts()
                     if now - last_quick_persist_ts >= 1.0:
                         last_quick_persist_ts = now
@@ -1761,7 +1971,6 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             quick_cp_snapshot = {
                                 "session_key": session_key,
                                 "updated_at": now,
-                                "done_targets": sorted(done_targets),
                                 "done": state.get("done", 0),
                                 "total": state.get("total", 0),
                             }
@@ -1818,8 +2027,23 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         return
 
     seen_targets = set()
-    all_targets = []
     skipped_by_resume = 0
+    skipped_by_history = 0
+    scanned_ips = collect_reported_ips() if skip_scanned_enabled else set()
+    discovered_total = 0
+    fed_count = 0
+    feed_sync_batch = 256
+
+    async def sync_feed_state(target_text=None, force=False):
+        if not force and (discovered_total % feed_sync_batch != 0):
+            return
+        async with state_lock:
+            state["total"] = discovered_total
+            state["feed_total"] = fed_count
+            state["fed"] = fed_count
+            if target_text:
+                state["current"] = f"Feeding target -> {target_text}"
+
     try:
         for node_file in node_files:
             with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -1828,7 +2052,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     if not line or line.startswith("#"):
                         continue
                     for raw_target in line.split():
-                        expanded, truncated = expand_target_entry(raw_target)
+                        expanded, truncated = expand_target_entry_iter(raw_target)
                         if truncated:
                             log_event(
                                 f"Target entry truncated: {raw_target} -> first {MAX_EXPANDED_TARGETS_PER_ENTRY}"
@@ -1837,24 +2061,42 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             if target in seen_targets:
                                 continue
                             seen_targets.add(target)
-                            all_targets.append(target)
+                            discovered_total += 1
+
+                            if resume_enabled and target in done_targets:
+                                skipped_by_resume += 1
+                                continue
+                            if skip_scanned_enabled and target in scanned_ips:
+                                skipped_by_history += 1
+                                continue
+
+                            fed_count += 1
+                            await sync_feed_state(target_text=target)
+                            await q.put(target)
+
+                            if feed_int > 0:
+                                queue_fill_ratio = q.qsize() / max(1, q.maxsize)
+                                if queue_fill_ratio <= final_rush_ratio:
+                                    current_feed_int = 0.0
+                                elif queue_fill_ratio >= accel_trigger_ratio:
+                                    current_feed_int = feed_int
+                                else:
+                                    span = max(
+                                        1e-9, accel_trigger_ratio - final_rush_ratio
+                                    )
+                                    level = (queue_fill_ratio - final_rush_ratio) / span
+                                    current_feed_int = feed_int * max(
+                                        0.0, min(1.0, level)
+                                    )
+                                current_feed_int = min(
+                                    feed_int, current_feed_int * max(0.0, accel_factor)
+                                )
+                                if current_feed_int > 0:
+                                    await asyncio.sleep(current_feed_int)
     except OSError:
         pass
 
-    async with state_lock:
-        state["total"] = len(all_targets)
-
-    skipped_by_history = 0
-    scanned_ips = collect_reported_ips() if skip_scanned_enabled else set()
-    pending_targets = []
-    for target in all_targets:
-        if resume_enabled and target in done_targets:
-            skipped_by_resume += 1
-            continue
-        if skip_scanned_enabled and target in scanned_ips:
-            skipped_by_history += 1
-            continue
-        pending_targets.append(target)
+    await sync_feed_state(force=True)
 
     if skipped_by_resume > 0 or skipped_by_history > 0:
         async with state_lock:
@@ -1867,27 +2109,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         if skipped_by_history > 0:
             log_event(f"History skipped {skipped_by_history} scanned targets")
 
-    pending_total = len(pending_targets)
-    async with state_lock:
-        state["feed_total"] = pending_total
-    for idx, target in enumerate(pending_targets, start=1):
-        async with state_lock:
-            state["current"] = f"Feeding target -> {target}"
-            state["fed"] = idx
-        await q.put(target)
-        if feed_int > 0:
-            remaining_ratio = (pending_total - idx) / max(1, pending_total)
-            current_feed_int = feed_int
-            if remaining_ratio <= final_rush_ratio:
-                current_feed_int = 0.0
-            elif remaining_ratio <= accel_trigger_ratio:
-                current_feed_int = feed_int * accel_factor
-            if current_feed_int > 0:
-                await asyncio.sleep(current_feed_int)
-
     for _ in range(threads):
         await q.put(None)
     await asyncio.gather(*workers)
+    if resume_enabled and checkpoint_pending_targets:
+        append_checkpoint_done_targets(session_key, checkpoint_pending_targets)
+        checkpoint_pending_targets.clear()
     state["status"] = "completed"
     state["current"] = "Completed"
     if tg_enabled:
@@ -2001,7 +2228,7 @@ def main_console():
         print(
             f"{panel_border}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
         )
-        print(panel_line(f"SAIA MASTER CONSOLE v23.5 | 天才猫"))
+        print(panel_line(f"SAIA MASTER CONSOLE v23.5 | 旗舰穿透版"))
         print(
             f"{panel_border}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
         )
@@ -2067,7 +2294,7 @@ def main_console():
                 max_value=3,
             )
             th = prompt_int(
-                "线程 (建议 50-300): ", default=20, min_value=1, max_value=1000
+                "线程 (建议 50-300): ", default=20, min_value=1, max_value=2000
             )
             default_ports = (
                 DEFAULT_XUI_PORTS
@@ -2203,7 +2430,7 @@ def main_console():
         elif c == "6":
             # 守护进程启动逻辑 (保持不变)
             m = prompt_int("守护模式 (3): ", default=3, min_value=1, max_value=3)
-            th = prompt_int("守护线程 (10): ", default=10, min_value=1, max_value=1000)
+            th = prompt_int("守护线程 (10): ", default=10, min_value=1, max_value=2000)
             default_ports = (
                 DEFAULT_XUI_PORTS
                 if m == 1
