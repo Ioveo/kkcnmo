@@ -2931,7 +2931,7 @@ def main_console():
 
         left_lines = [
             f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}",
-            f"{C_W}解析:{C_CYAN}{total}{C_W}/{parse_total} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{parse_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}",
+            f"{C_W}解析:{C_CYAN}{total}{C_W}/{parse_total} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{parse_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}模式:{C_CYAN}{work_mode_text}",
             f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{fed} ({C_CYAN}{progress_pct:5.1f}%{C_W})",
             f"{C_W}全体进度(含跳过): {parse_bar}  跳过:{C_CYAN}{skipped_total}{C_W}",
             f"{C_W}投喂进度条      : {feed_bar}",
