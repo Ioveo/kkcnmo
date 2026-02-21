@@ -2547,6 +2547,8 @@ def main_console():
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
+        spin_char = spinner[spin_idx % len(spinner)]
+        spin_idx += 1
         s = load_state(STATE_FILE)
         g = load_state(GUARDIAN_STATE_FILE)
         resume_cfg = load_resume_config()
@@ -2641,9 +2643,9 @@ def main_console():
         ]
 
         render_dual_panels(
-            "SAIA MASTER CONSOLE v23.5 | 旗舰穿透版",
+            f"SAIA MASTER CONSOLE v23.5 | 天才猫究极版 {spin_char}",
             left_lines,
-            "MONITOR DETAIL | 运行细节",
+            f"MONITOR DETAIL | 运行细节 {spin_char}",
             right_lines,
         )
 
@@ -2720,51 +2722,74 @@ def main_console():
             time.sleep(1)
 
         elif c == "2":
+            last_sig = None
+
+            def mon_line(text, inner=56):
+                t = str(text)
+                if len(t) > inner:
+                    t = t[: inner - 3] + "..."
+                return f"{C_BLUE}┃ {t.ljust(inner)} ┃{C_W}"
+
             while True:
                 st = load_state(STATE_FILE)
+                spin_char = spinner[spin_idx % len(spinner)]
+                spin_idx += 1
                 done = st.get("done", 0)
                 total = st.get("total", 0)
                 bar = render_progress_bar(done, total)
                 _, xui_verified, _, s5_verified = collect_report_sections(limit=None)
                 xui_recent = [format_result_line(l, "xui") for l in xui_verified[-3:]]
                 s5_recent = [format_result_line(l, "socks5") for l in s5_verified[-3:]]
-                spin_char = spinner[spin_idx % len(spinner)]
-                spin_idx += 1
-
-                os.system("cls" if os.name == "nt" else "clear")
-                # 极光监控仪表盘
-                print(
-                    f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
+                cur_ip = str(st.get("current_ip", "-"))
+                cur_port = str(st.get("current_port", "-"))
+                cur_service = str(st.get("current_service", "-"))
+                sig = (
+                    st.get("xui_found", 0),
+                    st.get("xui_verified", 0),
+                    st.get("s5_found", 0),
+                    st.get("s5_verified", 0),
+                    xui_recent[-1] if xui_recent else "",
+                    s5_recent[-1] if s5_recent else "",
                 )
-                print(
-                    f"{C_BLUE}┃ {C_W}{spin_char} {C_BOLD}REAL-TIME MONITOR{C_W}       | {C_DIM}Mode: {work_mode_label(st.get('work_mode', 2))}{C_BLUE}       ┃{C_W}"
-                )
-                print(
-                    f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
-                )
-                # XUI 行 (去除高光，统一对齐)
-                print(
-                    f"{C_BLUE}┃ {C_W}X-UI 面板  {C_BLUE}|{C_W} 发现: {C_CYAN}{st.get('xui_found', 0):<6}{C_W} | 沦陷: {C_WARN}{st.get('xui_verified', 0):<6}{C_BLUE} ┃{C_W}"
-                )
-                # S5 行 (去除高光，统一对齐)
-                print(
-                    f"{C_BLUE}┃ {C_W}SOCKS5代理 {C_BLUE}|{C_W} 连通: {C_CYAN}{st.get('s5_found', 0):<6}{C_W} | 穿透: {C_SUCC}{st.get('s5_verified', 0):<6}{C_BLUE} ┃{C_W}"
-                )
-                print(
-                    f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
-                )
-                print(
-                    f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {st.get('current', '-')[:24]:<24} 并行:{st.get('active_workers', 0):<4} {C_BLUE}┃{C_W}"
-                )
-                print(f"{C_BLUE}┃ {C_W}总体进度   {C_BLUE}|{C_W} {bar} {C_BLUE}┃{C_W}")
-                print(
-                    f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
-                )
-                print(f"\n{C_CYAN}[已验真结果 - XUI]{C_W}")
-                print("\n".join(xui_recent) if xui_recent else f"{C_DIM}-{C_W}")
-                print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
-                print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
-                print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                if sig != last_sig:
+                    last_sig = sig
+                    os.system("cls" if os.name == "nt" else "clear")
+                    print(
+                        f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
+                    )
+                    print(
+                        mon_line(
+                            f"{spin_char} REAL-TIME MONITOR | Mode: {work_mode_label(st.get('work_mode', 2))}"
+                        )
+                    )
+                    print(
+                        f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+                    )
+                    print(
+                        mon_line(
+                            f"XUI 发现:{st.get('xui_found', 0)}  验真:{st.get('xui_verified', 0)}"
+                        )
+                    )
+                    print(
+                        mon_line(
+                            f"S5  连通:{st.get('s5_found', 0)}  真穿透:{st.get('s5_verified', 0)}"
+                        )
+                    )
+                    print(
+                        mon_line(
+                            f"当前目标:{cur_service} {cur_ip}:{cur_port}  并行:{st.get('active_workers', 0)}"
+                        )
+                    )
+                    print(mon_line(f"当前动作:{st.get('current', '-')}"))
+                    print(mon_line(f"总体进度:{bar}"))
+                    print(
+                        f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
+                    )
+                    print(f"\n{C_CYAN}[已验真结果 - XUI]{C_W}")
+                    print("\n".join(xui_recent) if xui_recent else f"{C_DIM}-{C_W}")
+                    print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
+                    print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
+                    print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
                 if poll_zero_to_back(0.5):
                     break
 
