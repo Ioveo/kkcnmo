@@ -40,6 +40,8 @@ FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
 RUN_LOCK_FILE = os.path.join(BASE_DIR, "audit_runner.lock")
+GUARDIAN_LOCK_FILE = os.path.join(BASE_DIR, "guardian_runner.lock")
+GUARDIAN_CTRL_FILE = os.path.join(BASE_DIR, "guardian_control.json")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_VERIFIED_EVENTS_BYTES = 4 * 1024 * 1024
@@ -517,6 +519,8 @@ def cleanup_runtime_files():
         LOG_FILE,
         REPORT_FILE,
         GUARDIAN_STATE_FILE,
+        GUARDIAN_LOCK_FILE,
+        GUARDIAN_CTRL_FILE,
         TELEGRAM_CFG_FILE,
         RESUME_CFG_FILE,
         FEED_CFG_FILE,
@@ -565,6 +569,7 @@ def cleanup_runtime_files():
 
 
 def one_key_cleanup():
+    set_guardian_enabled(False)
     pids = set()
     for sf in (STATE_FILE, GUARDIAN_STATE_FILE):
         st = load_state(sf)
@@ -574,11 +579,16 @@ def one_key_cleanup():
     lock_pid = _read_lock_pid(RUN_LOCK_FILE)
     if lock_pid > 0:
         pids.add(lock_pid)
+    guardian_lock_pid = _read_lock_pid(GUARDIAN_LOCK_FILE)
+    if guardian_lock_pid > 0:
+        pids.add(guardian_lock_pid)
 
     stopped = 0
     for pid in sorted(pids):
         if stop_process(pid):
             stopped += 1
+
+    stopped += stop_guardian_processes_fallback()
 
     removed = cleanup_runtime_files()
     gc.collect()
@@ -687,16 +697,6 @@ def render_progress_bar(done, total, width=28):
     return f"[{bar_str}] {ratio * 100:5.1f}%"
 
 
-def resolve_node_file():
-    if os.path.exists(NODE_FILE):
-        return NODE_FILE
-    if os.path.exists(FALLBACK_NODE_FILE):
-        return FALLBACK_NODE_FILE
-    if os.path.exists(FALLBACK_NODE_FILE_UPPER):
-        return FALLBACK_NODE_FILE_UPPER
-    return None
-
-
 def resolve_node_files():
     files = []
     if os.path.exists(NODE_FILE):
@@ -735,6 +735,27 @@ def default_telegram_config():
 
 def default_resume_config():
     return {"enabled": True, "skip_scanned": False}
+
+
+def default_guardian_control():
+    return {"enabled": False}
+
+
+def load_guardian_control():
+    cfg = default_guardian_control()
+    data = load_state(GUARDIAN_CTRL_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+    cfg["enabled"] = bool(cfg.get("enabled", False))
+    return cfg
+
+
+def set_guardian_enabled(enabled):
+    save_state(GUARDIAN_CTRL_FILE, {"enabled": bool(enabled), "updated_at": now_ts()})
+
+
+def is_guardian_enabled():
+    return bool(load_guardian_control().get("enabled", False))
 
 
 def load_resume_config():
@@ -963,6 +984,59 @@ def stop_process(pid):
         return False
 
 
+def stop_guardian_processes_fallback():
+    killed = 0
+    this_file = os.path.abspath(__file__).lower()
+
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                [
+                    "cmd",
+                    "/c",
+                    "wmic process get ProcessId,CommandLine /FORMAT:CSV",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for raw in out.splitlines():
+                low = raw.lower()
+                if "guardian" not in low:
+                    continue
+                if os.path.basename(this_file) not in low:
+                    continue
+                parts = [x.strip() for x in raw.split(",") if x.strip()]
+                if not parts:
+                    continue
+                pid_txt = parts[-1]
+                if not pid_txt.isdigit():
+                    continue
+                pid = int(pid_txt)
+                if pid > 0 and stop_process(pid):
+                    killed += 1
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        return killed
+
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,args"], text=True)
+        for raw in out.splitlines():
+            low = raw.lower()
+            if " guardian" not in low:
+                continue
+            if os.path.basename(this_file) not in low:
+                continue
+            seg = raw.strip().split(None, 1)
+            if not seg or not seg[0].isdigit():
+                continue
+            pid = int(seg[0])
+            if pid > 0 and stop_process(pid):
+                killed += 1
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return killed
+
+
 def _read_lock_pid(lock_file):
     try:
         with open(lock_file, "r", encoding="utf-8", errors="replace") as f:
@@ -1011,6 +1085,14 @@ def release_run_lock(lock_file=RUN_LOCK_FILE):
             os.remove(lock_file)
     except OSError:
         pass
+
+
+def acquire_guardian_lock(lock_file=GUARDIAN_LOCK_FILE):
+    return acquire_run_lock(lock_file)
+
+
+def release_guardian_lock(lock_file=GUARDIAN_LOCK_FILE):
+    release_run_lock(lock_file)
 
 
 def parse_ports(raw):
@@ -1533,6 +1615,13 @@ def run_guardian(
     pending_dead_pid = None
     pending_dead_since = 0.0
     while True:
+        if not is_guardian_enabled():
+            gs = load_state(GUARDIAN_STATE_FILE)
+            gs["status"] = "stopped"
+            gs["last_note"] = "disabled_by_user"
+            gs["updated_at"] = now_ts()
+            save_state(GUARDIAN_STATE_FILE, gs)
+            break
         mem_mb = get_available_memory_mb()
         st = load_state(STATE_FILE)
         if not is_alive(st.get("pid")):
@@ -2546,7 +2635,8 @@ def main_console():
         return f"{h:02d}:{m:02d}:{s:02d}"
 
     while True:
-        os.system("cls" if os.name == "nt" else "clear")
+        sys.stdout.write("\x1b[H\x1b[J")
+        sys.stdout.flush()
         spin_char = spinner[spin_idx % len(spinner)]
         spin_idx += 1
         s = load_state(STATE_FILE)
@@ -2643,7 +2733,7 @@ def main_console():
         ]
 
         render_dual_panels(
-            f"SAIA MASTER CONSOLE v23.5 | 天才猫究极版 {spin_char}",
+            f"SAIA MASTER CONSOLE v23.5 | 旗舰穿透版 {spin_char}",
             left_lines,
             f"MONITOR DETAIL | 运行细节 {spin_char}",
             right_lines,
@@ -2660,7 +2750,7 @@ def main_console():
         try:
             c = timed_input(
                 f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}",
-                timeout_sec=10.0,
+                timeout_sec=1.0,
             ).strip()
         except KeyboardInterrupt:
             print(f"\n{C_DIM}已取消输入，返回主菜单刷新...{C_W}")
@@ -2722,14 +2812,6 @@ def main_console():
             time.sleep(1)
 
         elif c == "2":
-            last_sig = None
-
-            def mon_line(text, inner=56):
-                t = str(text)
-                if len(t) > inner:
-                    t = t[: inner - 3] + "..."
-                return f"{C_BLUE}┃ {t.ljust(inner)} ┃{C_W}"
-
             while True:
                 st = load_state(STATE_FILE)
                 spin_char = spinner[spin_idx % len(spinner)]
@@ -2740,56 +2822,52 @@ def main_console():
                 _, xui_verified, _, s5_verified = collect_report_sections(limit=None)
                 xui_recent = [format_result_line(l, "xui") for l in xui_verified[-3:]]
                 s5_recent = [format_result_line(l, "socks5") for l in s5_verified[-3:]]
+
+                cur_service = str(st.get("current_service", "-"))
                 cur_ip = str(st.get("current_ip", "-"))
                 cur_port = str(st.get("current_port", "-"))
-                cur_service = str(st.get("current_service", "-"))
-                sig = (
-                    st.get("xui_found", 0),
-                    st.get("xui_verified", 0),
-                    st.get("s5_found", 0),
-                    st.get("s5_verified", 0),
-                    xui_recent[-1] if xui_recent else "",
-                    s5_recent[-1] if s5_recent else "",
+                cur_target = f"{cur_service} {cur_ip}:{cur_port}"
+                if len(cur_target) > 28:
+                    cur_target = cur_target[:28]
+                cur_action = str(st.get("current", "-"))
+                if len(cur_action) > 24:
+                    cur_action = cur_action[:24]
+
+                sys.stdout.write("\x1b[H\x1b[J")
+                sys.stdout.flush()
+                print(
+                    f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
                 )
-                if sig != last_sig:
-                    last_sig = sig
-                    os.system("cls" if os.name == "nt" else "clear")
-                    print(
-                        f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
-                    )
-                    print(
-                        mon_line(
-                            f"{spin_char} REAL-TIME MONITOR | Mode: {work_mode_label(st.get('work_mode', 2))}"
-                        )
-                    )
-                    print(
-                        f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
-                    )
-                    print(
-                        mon_line(
-                            f"XUI 发现:{st.get('xui_found', 0)}  验真:{st.get('xui_verified', 0)}"
-                        )
-                    )
-                    print(
-                        mon_line(
-                            f"S5  连通:{st.get('s5_found', 0)}  真穿透:{st.get('s5_verified', 0)}"
-                        )
-                    )
-                    print(
-                        mon_line(
-                            f"当前目标:{cur_service} {cur_ip}:{cur_port}  并行:{st.get('active_workers', 0)}"
-                        )
-                    )
-                    print(mon_line(f"当前动作:{st.get('current', '-')}"))
-                    print(mon_line(f"总体进度:{bar}"))
-                    print(
-                        f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
-                    )
-                    print(f"\n{C_CYAN}[已验真结果 - XUI]{C_W}")
-                    print("\n".join(xui_recent) if xui_recent else f"{C_DIM}-{C_W}")
-                    print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
-                    print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
-                    print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                print(
+                    f"{C_BLUE}┃ {C_W}{spin_char} {C_BOLD}REAL-TIME MONITOR{C_W}       | {C_DIM}Mode: {work_mode_label(st.get('work_mode', 2))}{C_BLUE}       ┃{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┃ {C_W}X-UI 面板  {C_BLUE}|{C_W} 发现: {C_CYAN}{st.get('xui_found', 0):<6}{C_W} | 沦陷: {C_WARN}{st.get('xui_verified', 0):<6}{C_BLUE} ┃{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┃ {C_W}SOCKS5代理 {C_BLUE}|{C_W} 连通: {C_CYAN}{st.get('s5_found', 0):<6}{C_W} | 穿透: {C_SUCC}{st.get('s5_verified', 0):<6}{C_BLUE} ┃{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┃ {C_W}当前目标   {C_BLUE}|{C_CYAN} {cur_target:<28}{C_W} 并行:{st.get('active_workers', 0):<4} {C_BLUE}┃{C_W}"
+                )
+                print(
+                    f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {cur_action:<24} 验证中:{st.get('verifying_ip_count', 0):<4} {C_BLUE}┃{C_W}"
+                )
+                print(f"{C_BLUE}┃ {C_W}总体进度   {C_BLUE}|{C_W} {bar} {C_BLUE}┃{C_W}")
+                print(
+                    f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
+                )
+                print(f"\n{C_CYAN}[已验真结果 - XUI]{C_W}")
+                print("\n".join(xui_recent) if xui_recent else f"{C_DIM}-{C_W}")
+                print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
+                print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
+                print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
                 if poll_zero_to_back(0.5):
                     break
 
@@ -2875,6 +2953,7 @@ def main_console():
                 print("端口无效")
                 time.sleep(1)
                 continue
+            set_guardian_enabled(True)
             subprocess.Popen(
                 [
                     sys.executable,
@@ -3033,8 +3112,18 @@ def main_console():
             time.sleep(1)
 
         elif c == "8":
+            set_guardian_enabled(False)
             gpid = load_state(GUARDIAN_STATE_FILE).get("pid")
+            glock_pid = _read_lock_pid(GUARDIAN_LOCK_FILE)
+            stopped_any = False
             if stop_process(gpid):
+                stopped_any = True
+            if glock_pid and glock_pid != gpid and stop_process(glock_pid):
+                stopped_any = True
+            fallback_killed = stop_guardian_processes_fallback()
+            if fallback_killed > 0:
+                stopped_any = True
+            if stopped_any:
                 print(f"{C_WARN}>>> 守护进程已停止{C_W}")
             else:
                 print(f"{C_DIM}没有运行中的守护{C_W}")
@@ -3207,7 +3296,13 @@ if __name__ == "__main__":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 6:
             raise SystemExit("参数不足")
+        got_g_lock, g_holder_pid = acquire_guardian_lock()
+        if not got_g_lock:
+            if g_holder_pid > 0:
+                raise SystemExit(f"已有守护进程运行中 (PID {g_holder_pid})")
+            raise SystemExit("已有守护进程运行中")
         try:
+            set_guardian_enabled(True)
             mode, work_mode, threads, ports_str = (
                 int(sys.argv[2]),
                 int(sys.argv[3]),
@@ -3231,5 +3326,7 @@ if __name__ == "__main__":
         except Exception:
             log_exception("fatal crash in guardian mode")
             raise
+        finally:
+            release_guardian_lock()
     else:
         main_console()
