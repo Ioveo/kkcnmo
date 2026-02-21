@@ -595,6 +595,20 @@ def one_key_cleanup():
     return stopped, removed
 
 
+def disable_and_stop_guardian_processes():
+    set_guardian_enabled(False)
+    stopped_any = False
+    gpid = load_state(GUARDIAN_STATE_FILE).get("pid")
+    glock_pid = _read_lock_pid(GUARDIAN_LOCK_FILE)
+    if stop_process(gpid):
+        stopped_any = True
+    if glock_pid and glock_pid != gpid and stop_process(glock_pid):
+        stopped_any = True
+    if stop_guardian_processes_fallback() > 0:
+        stopped_any = True
+    return stopped_any
+
+
 def reload_running_audit():
     st = load_state(STATE_FILE)
     pid = int(st.get("pid", 0) or 0)
@@ -2634,18 +2648,12 @@ def main_console():
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
+    if not is_guardian_enabled():
+        disable_and_stop_guardian_processes()
+
     while True:
         sys.stdout.write("\x1b[H\x1b[J")
         sys.stdout.flush()
-        if not is_guardian_enabled():
-            g_state = load_state(GUARDIAN_STATE_FILE)
-            g_pid = int(g_state.get("pid", 0) or 0) if isinstance(g_state, dict) else 0
-            if g_pid > 0:
-                stop_process(g_pid)
-            g_lock_pid = _read_lock_pid(GUARDIAN_LOCK_FILE)
-            if g_lock_pid > 0 and g_lock_pid != g_pid:
-                stop_process(g_lock_pid)
-            stop_guardian_processes_fallback()
         s = load_state(STATE_FILE)
         g = load_state(GUARDIAN_STATE_FILE)
         resume_cfg = load_resume_config()
@@ -2854,8 +2862,7 @@ def main_console():
                 if len(cur_action) > 24:
                     cur_action = cur_action[:24]
 
-                sys.stdout.write("\x1b[H\x1b[J")
-                sys.stdout.flush()
+                os.system("cls" if os.name == "nt" else "clear")
                 print(
                     f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
                 )
@@ -2943,6 +2950,7 @@ def main_console():
             wait_for_zero_return(f"\n{C_BLUE}输入 0 返回...{C_W}")
 
         elif c == "5":
+            disable_and_stop_guardian_processes()
             pid = load_state(STATE_FILE).get("pid")
             if stop_process(pid):
                 st = load_state(STATE_FILE)
@@ -3133,17 +3141,7 @@ def main_console():
             time.sleep(1)
 
         elif c == "8":
-            set_guardian_enabled(False)
-            gpid = load_state(GUARDIAN_STATE_FILE).get("pid")
-            glock_pid = _read_lock_pid(GUARDIAN_LOCK_FILE)
-            stopped_any = False
-            if stop_process(gpid):
-                stopped_any = True
-            if glock_pid and glock_pid != gpid and stop_process(glock_pid):
-                stopped_any = True
-            fallback_killed = stop_guardian_processes_fallback()
-            if fallback_killed > 0:
-                stopped_any = True
+            stopped_any = disable_and_stop_guardian_processes()
             if stopped_any:
                 print(f"{C_WARN}>>> 守护进程已停止{C_W}")
             else:
