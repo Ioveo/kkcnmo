@@ -1081,6 +1081,50 @@ def iter_expanded_targets(raw_target):
     yield target
 
 
+def estimate_expanded_target_count(raw_target):
+    target = raw_target.strip()
+    if not target:
+        return 0
+
+    if "/" in target:
+        try:
+            net = ipaddress.ip_network(target, strict=False)
+            if net.num_addresses <= 1:
+                return 1
+            if isinstance(net, ipaddress.IPv4Network):
+                if net.prefixlen >= 31:
+                    return int(net.num_addresses)
+                return max(0, int(net.num_addresses) - 2)
+            return max(1, int(net.num_addresses) - 1)
+        except ValueError:
+            pass
+
+    if "-" in target:
+        left, right = target.split("-", 1)
+        left = left.strip()
+        right = right.strip()
+
+        try:
+            start_ip = ipaddress.ip_address(left)
+            end_ip = ipaddress.ip_address(right)
+            if start_ip.version == end_ip.version and int(end_ip) >= int(start_ip):
+                return int(end_ip) - int(start_ip) + 1
+        except ValueError:
+            pass
+
+        try:
+            start_ip = ipaddress.ip_address(left)
+            if start_ip.version == 4 and right.isdigit():
+                start_last = int(left.split(".")[-1])
+                end_last = int(right)
+                if 0 <= end_last <= 255 and end_last >= start_last:
+                    return end_last - start_last + 1
+        except ValueError:
+            pass
+
+    return 1
+
+
 def prompt_int(msg, default, min_value=None, max_value=None):
     while True:
         raw = input(msg).strip()
@@ -1870,6 +1914,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "mode": mode,
         "threads": threads,
         "ports_raw": ports_raw,
+        "parse_est_total": 0,
         "total": 0,
         "done": 0,
         "fed": 0,
@@ -2293,6 +2338,23 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         save_state(STATE_FILE, state)
         return
 
+    parse_est_total = 0
+    try:
+        for node_file in node_files:
+            with open(node_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for raw_target in line.split():
+                        parse_est_total += estimate_expanded_target_count(raw_target)
+    except OSError:
+        pass
+    if parse_est_total <= 0:
+        parse_est_total = 1
+    async with state_lock:
+        state["parse_est_total"] = parse_est_total
+
     seen_targets = set()
     skipped_by_resume = 0
     skipped_by_history = 0
@@ -2463,15 +2525,16 @@ def main_console():
         done = int(s.get("done", 0))
         total = int(s.get("total", 0))
         fed = int(s.get("fed", 0))
-        feed_total = int(s.get("feed_total", 0))
+        parse_est_total = int(s.get("parse_est_total", 0))
         skipped_resume = int(s.get("skipped_resume", 0))
         skipped_history = int(s.get("skipped_history", 0))
         skipped_total = skipped_resume + skipped_history
         worker_done = max(0, done - skipped_total)
         parse_done = bool(s.get("feeding_done", False))
-        parse_bar = render_progress_bar(done, total, width=24)
-        worker_bar = render_progress_bar(worker_done, feed_total, width=24)
-        progress_ratio = (worker_done / feed_total) if feed_total > 0 else 0.0
+        parse_total = max(parse_est_total, total, 1)
+        parse_bar = render_progress_bar(total, parse_total, width=24)
+        feed_bar = render_progress_bar(fed, parse_total, width=24)
+        progress_ratio = (worker_done / fed) if fed > 0 else 0.0
         progress_pct = progress_ratio * 100.0
         active_workers = int(s.get("active_workers", 0))
         socket_limit = int(s.get("socket_limit", 0))
@@ -2521,10 +2584,10 @@ def main_console():
 
         left_lines = [
             f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}",
-            f"{C_W}解析:{C_CYAN}{total}{C_W} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{feed_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}",
-            f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{feed_total} ({C_CYAN}{progress_pct:5.1f}%{C_W})",
+            f"{C_W}解析:{C_CYAN}{total}{C_W}/{parse_total} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{parse_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}",
+            f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{fed} ({C_CYAN}{progress_pct:5.1f}%{C_W})",
             f"{C_W}全体进度(含跳过): {parse_bar}  跳过:{C_CYAN}{skipped_total}{C_W}",
-            f"{C_W}投喂进度条      : {worker_bar}",
+            f"{C_W}投喂进度条      : {feed_bar}",
             f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_CYAN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_CYAN}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}",
             f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}",
             f"{C_W}当前:{C_DIM}{current}{C_W}",
@@ -2587,7 +2650,7 @@ def main_console():
                 max_value=3,
             )
             th = prompt_int(
-                "线程 (建议 50-300): ", default=20, min_value=1, max_value=1000
+                "线程 (默认 1000): ", default=1000, min_value=1, max_value=1000
             )
             default_ports = (
                 DEFAULT_XUI_PORTS
@@ -2730,7 +2793,9 @@ def main_console():
         elif c == "6":
             # 守护进程启动逻辑 (保持不变)
             m = prompt_int("守护模式 (3): ", default=3, min_value=1, max_value=3)
-            th = prompt_int("守护线程 (10): ", default=10, min_value=1, max_value=1000)
+            th = prompt_int(
+                "守护线程 (1000): ", default=1000, min_value=1, max_value=1000
+            )
             default_ports = (
                 DEFAULT_XUI_PORTS
                 if m == 1
