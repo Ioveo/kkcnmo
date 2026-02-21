@@ -73,7 +73,13 @@ DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
     "1234,4321,8000,9000,6868,6688,8866,9527,1472,2583,3694,10000-10010"
 )
+DEFAULT_S5_PORTS_HIGH = (
+    "1080-1085,10808-10810,2012,2080,4145,3128,10080,8080,8888,9999,"
+    "1111,2222,3333,4444,5555,6666,7777,20000-20010,30000-30010,40000-40010,"
+    "51234,65535,43892,11111,22222,33333"
+)
 DEFAULT_MIXED_PORTS = f"{DEFAULT_XUI_PORTS},{DEFAULT_S5_PORTS}"
+DEFAULT_MIXED_PORTS_HIGH = f"{DEFAULT_XUI_PORTS},{DEFAULT_S5_PORTS_HIGH}"
 ASN_DB_FILE = os.path.join(BASE_DIR, "GeoLite2-ASN.mmdb")
 COUNTRY_DB_CANDIDATES = [
     os.path.join(BASE_DIR, "GeoLite2-Country.mmdb"),
@@ -122,6 +128,10 @@ def save_state(path, state):
         pass
 
 
+async def save_state_async(path, state):
+    await asyncio.to_thread(save_state, path, state)
+
+
 def load_state(path):
     if not os.path.exists(path):
         return {}
@@ -158,6 +168,10 @@ def append_rotating(file_path, text, max_bytes, backup_count):
         pass
 
 
+async def append_rotating_async(file_path, text, max_bytes, backup_count):
+    await asyncio.to_thread(append_rotating, file_path, text, max_bytes, backup_count)
+
+
 def log_event(msg):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     append_rotating(LOG_FILE, f"[{stamp}] {msg}\n", MAX_LOG_BYTES, LOG_BACKUPS)
@@ -185,6 +199,10 @@ def record_verified_event(line):
         MAX_VERIFIED_EVENTS_BYTES,
         VERIFIED_EVENTS_BACKUPS,
     )
+
+
+async def record_verified_event_async(line):
+    await asyncio.to_thread(record_verified_event, line)
 
 
 def collect_verified_last_24h(now_dt=None):
@@ -1966,7 +1984,7 @@ async def audit_xui(
             state["verifying_ip_count"] = state.get("verifying_ip_count", 0) + 1
             verify_state_snapshot = dict(state)
         if verify_state_snapshot is not None:
-            save_state(STATE_FILE, verify_state_snapshot)
+            await save_state_async(STATE_FILE, verify_state_snapshot)
         try:
             for proto, use_ssl, country, asn, login_path in found_candidates:
                 for idx, (u, p) in enumerate(tokens, start=1):
@@ -2002,7 +2020,7 @@ async def audit_xui(
                     state["verify_line"] = "-"
                 verify_state_snapshot = dict(state)
             if verify_state_snapshot is not None:
-                save_state(STATE_FILE, verify_state_snapshot)
+                await save_state_async(STATE_FILE, verify_state_snapshot)
 
         if work_mode == 2:
             proto, _, country, asn, _ = found_candidates[0]
@@ -2022,11 +2040,17 @@ async def audit_socks5(
 ):
     async def check_l7(reader, writer):
         try:
-            req = b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nUser-Agent: curl/7.68.0\r\nConnection: close\r\n\r\n"
+            req = (
+                b"GET /hotspot-detect.html HTTP/1.1\r\n"
+                b"Host: captive.apple.com\r\n"
+                b"User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15\r\n"
+                b"Connection: close\r\n\r\n"
+            )
             writer.write(req)
             await writer.drain()
             res = await asyncio.wait_for(reader.read(1024), timeout=3.0)
-            if b"HTTP/1." in res or b"301 Moved" in res or b"<html>" in res.lower():
+            low = res.lower()
+            if b"success" in low or b"200 ok" in low:
                 return True
         except Exception:
             pass
@@ -2088,7 +2112,7 @@ async def audit_socks5(
                 state["verifying_ip_count"] = state.get("verifying_ip_count", 0) + 1
                 verify_state_snapshot = dict(state)
             if verify_state_snapshot is not None:
-                save_state(STATE_FILE, verify_state_snapshot)
+                await save_state_async(STATE_FILE, verify_state_snapshot)
             try:
                 for idx, (u, p) in enumerate(tokens, start=1):
                     w3 = None
@@ -2173,7 +2197,7 @@ async def audit_socks5(
                         state["verify_line"] = "-"
                     verify_state_snapshot = dict(state)
                 if verify_state_snapshot is not None:
-                    save_state(STATE_FILE, verify_state_snapshot)
+                    await save_state_async(STATE_FILE, verify_state_snapshot)
 
             if work_mode in (2, 3):
                 return f"[S5_FOUND] [节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
@@ -2437,9 +2461,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 ):
                     should_send_daily = True
             if state_snapshot is not None:
-                save_state(STATE_FILE, state_snapshot)
+                await save_state_async(STATE_FILE, state_snapshot)
             if checkpoint_targets is not None:
-                save_state(
+                await save_state_async(
                     CHECKPOINT_FILE,
                     {
                         "session_key": session_key,
@@ -2532,14 +2556,14 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         for r in found_res:
                             state["recent"] = (state["recent"] + [r])[-6:]
                     for r in found_res:
-                        append_rotating(
+                        await append_rotating_async(
                             REPORT_FILE,
                             r + "\n",
                             MAX_REPORT_BYTES,
                             REPORT_BACKUPS,
                         )
                         if ("[高危-后台沦陷]" in r) or ("[优质-真穿透]" in r):
-                            record_verified_event(r)
+                            await record_verified_event_async(r)
                     _, enabled, _, cond_mode, _ = tg_runtime()
                     if enabled and cond_mode in (1, 2, 3):
                         matched = [
@@ -2631,7 +2655,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         special_snapshot = None
                         special_recent = []
                 if quick_state_snapshot is not None:
-                    save_state(STATE_FILE, quick_state_snapshot)
+                    await save_state_async(STATE_FILE, quick_state_snapshot)
                 if special_snapshot is not None:
                     schedule_telegram(
                         build_interval_message(special_snapshot, special_recent)
@@ -2654,7 +2678,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         state["status"] = "completed"
         flush_stop.set()
         await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
-        save_state(STATE_FILE, state)
+        await save_state_async(STATE_FILE, state)
         return
 
     parse_est_total = 0
@@ -2762,7 +2786,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         await asyncio.gather(*list(notify_tasks), return_exceptions=True)
     if state.get("done", 0) >= state.get("total", 0):
         clear_checkpoint()
-    save_state(STATE_FILE, state)
+    await save_state_async(STATE_FILE, state)
 
 
 # ==================== 管理界面 (极光UI版) ====================
@@ -2983,6 +3007,12 @@ def main_console():
                 if m == 2
                 else DEFAULT_MIXED_PORTS
             )
+            if m in (2, 3):
+                seg = input("端口段 (1=低段默认 / 2=高段, 默认1): ").strip()
+                if seg == "2":
+                    default_ports = (
+                        DEFAULT_S5_PORTS_HIGH if m == 2 else DEFAULT_MIXED_PORTS_HIGH
+                    )
             ps = input(f"端口 (默认 {default_ports[:20]}...): ") or default_ports
             if not parse_ports(ps):
                 print("端口无效")
@@ -3164,6 +3194,12 @@ def main_console():
                 if m == 2
                 else DEFAULT_MIXED_PORTS
             )
+            if m in (2, 3):
+                seg = input("端口段 (1=低段默认 / 2=高段, 默认1): ").strip()
+                if seg == "2":
+                    default_ports = (
+                        DEFAULT_S5_PORTS_HIGH if m == 2 else DEFAULT_MIXED_PORTS_HIGH
+                    )
             ps = input(f"端口 (默认 {default_ports[:20]}...): ") or default_ports
             if not parse_ports(ps):
                 print("端口无效")
