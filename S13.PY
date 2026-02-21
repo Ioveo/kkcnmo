@@ -2223,15 +2223,30 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state["feed_accel_trigger_ratio"] = accel_trigger_ratio
     state["feed_final_rush_ratio"] = final_rush_ratio
     state["feed_accel_factor"] = accel_factor
-    tg_cfg = load_telegram_config()
-    tg_enabled = (
-        tg_cfg.get("enabled")
-        and bool(tg_cfg.get("bot_token"))
-        and bool(tg_cfg.get("chat_id"))
-    )
-    tg_interval_sec = max(0, int(tg_cfg.get("interval_minutes", 0))) * 60
-    tg_condition_mode = int(tg_cfg.get("condition_mode", 2))
-    tg_verified_threshold = int(tg_cfg.get("verified_threshold", 5))
+
+    def tg_runtime():
+        cfg = load_telegram_config()
+        enabled = (
+            cfg.get("enabled")
+            and bool(cfg.get("bot_token"))
+            and bool(cfg.get("chat_id"))
+        )
+        try:
+            interval_sec = max(0, int(cfg.get("interval_minutes", 0))) * 60
+        except (TypeError, ValueError):
+            interval_sec = 0
+        try:
+            cond_mode = int(cfg.get("condition_mode", 2))
+        except (TypeError, ValueError):
+            cond_mode = 2
+        if cond_mode not in (0, 1, 2, 3, 4):
+            cond_mode = 2
+        try:
+            threshold = max(1, int(cfg.get("verified_threshold", 5)))
+        except (TypeError, ValueError):
+            threshold = 5
+        return cfg, enabled, interval_sec, cond_mode, threshold
+
     last_interval_push_ts = 0.0
     last_daily_push_date = ""
     last_quick_persist_ts = 0.0
@@ -2264,26 +2279,28 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     state["s5_ports_total"] = len(s5_ports)
 
     async def push_telegram(text):
-        if not tg_enabled:
+        cfg, enabled, _, _, _ = tg_runtime()
+        if not enabled:
             return
         ok, detail = await send_telegram_message_async(
-            tg_cfg["bot_token"], tg_cfg["chat_id"], text
+            cfg.get("bot_token", ""), cfg.get("chat_id", ""), text
         )
         if not ok:
             log_event(f"Telegram send failed: {detail}")
 
     def schedule_telegram(text):
-        if not tg_enabled:
+        _, enabled, _, _, _ = tg_runtime()
+        if not enabled:
             return
         task = asyncio.create_task(push_telegram(text))
         notify_tasks.add(task)
         task.add_done_callback(lambda t: notify_tasks.discard(t))
 
-    def should_push_condition(line):
+    def should_push_condition(line, cond_mode):
         is_verified = is_verified_output_line(line)
-        if tg_condition_mode == 0:
+        if cond_mode == 0:
             return False
-        if tg_condition_mode in (1, 2, 3, 4):
+        if cond_mode in (1, 2, 3, 4):
             return is_verified
         return False
 
@@ -2332,6 +2349,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
             now = now_ts()
             now_dt = datetime.now()
+            _, tg_enabled_now, tg_interval_now, _, _ = tg_runtime()
             should_send_interval = False
             should_send_daily = False
             snapshot = None
@@ -2367,9 +2385,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         checkpoint_size = done_size
                     last_checkpoint_ts = now
                 if (
-                    tg_enabled
-                    and tg_interval_sec > 0
-                    and now - last_interval_push_ts >= tg_interval_sec
+                    tg_enabled_now
+                    and tg_interval_now > 0
+                    and now - last_interval_push_ts >= tg_interval_now
                     and state.get("total", 0) > 0
                 ):
                     verified_recent = [
@@ -2388,7 +2406,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     }
                     recent_lines = verified_recent[-5:]
                 if (
-                    tg_enabled
+                    tg_enabled_now
                     and now_dt.hour == 9
                     and now_dt.minute < 2
                     and last_daily_push_date != now_dt.strftime("%Y-%m-%d")
@@ -2483,8 +2501,11 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         )
                         if ("[高危-后台沦陷]" in r) or ("[优质-真穿透]" in r):
                             record_verified_event(r)
-                    if tg_enabled and tg_condition_mode in (1, 2, 3):
-                        matched = [r for r in found_res if should_push_condition(r)]
+                    _, enabled, _, cond_mode, _ = tg_runtime()
+                    if enabled and cond_mode in (1, 2, 3):
+                        matched = [
+                            r for r in found_res if should_push_condition(r, cond_mode)
+                        ]
                         if matched:
                             async with state_lock:
                                 matched_snapshot = {
@@ -2546,9 +2567,10 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     if now - last_quick_persist_ts >= 1.0:
                         last_quick_persist_ts = now
                         quick_state_snapshot = dict(state)
+                    _, enabled, _, cond_mode, tg_verified_threshold = tg_runtime()
                     need_special_or_push = (
-                        tg_enabled
-                        and tg_condition_mode == 4
+                        enabled
+                        and cond_mode == 4
                         and not special_or_sent
                         and (
                             state.get("xui_verified", 0) + state.get("s5_verified", 0)
@@ -2676,7 +2698,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     await asyncio.gather(*workers)
     state["status"] = "completed"
     state["current"] = "Completed"
-    if tg_enabled:
+    _, enabled, _, cond_mode, _ = tg_runtime()
+    if enabled:
         final_snapshot = {
             "done": state.get("done", 0),
             "total": state.get("total", 0),
@@ -2688,7 +2711,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         final_recent = [
             x for x in list(state.get("recent", [])) if is_verified_output_line(x)
         ][-5:]
-        if tg_condition_mode == 4:
+        if cond_mode == 4:
             if (not special_or_sent) and final_recent:
                 schedule_telegram(build_interval_message(final_snapshot, final_recent))
         else:
