@@ -1638,6 +1638,9 @@ def run_guardian(
     check_interval=20,
     min_free_mb=256.0,
 ):
+    if not is_guardian_enabled():
+        return
+
     def guardian_tg_push(text):
         cfg = load_telegram_config()
         if not (
@@ -3383,7 +3386,6 @@ if __name__ == "__main__":
                 raise SystemExit(f"已有守护进程运行中 (PID {g_holder_pid})")
             raise SystemExit("已有守护进程运行中")
         try:
-            set_guardian_enabled(True)
             mode, work_mode, threads, ports_str = (
                 int(sys.argv[2]),
                 int(sys.argv[3]),
