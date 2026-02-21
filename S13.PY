@@ -2637,8 +2637,15 @@ def main_console():
     while True:
         sys.stdout.write("\x1b[H\x1b[J")
         sys.stdout.flush()
-        spin_char = spinner[spin_idx % len(spinner)]
-        spin_idx += 1
+        if not is_guardian_enabled():
+            g_state = load_state(GUARDIAN_STATE_FILE)
+            g_pid = int(g_state.get("pid", 0) or 0) if isinstance(g_state, dict) else 0
+            if g_pid > 0:
+                stop_process(g_pid)
+            g_lock_pid = _read_lock_pid(GUARDIAN_LOCK_FILE)
+            if g_lock_pid > 0 and g_lock_pid != g_pid:
+                stop_process(g_lock_pid)
+            stop_guardian_processes_fallback()
         s = load_state(STATE_FILE)
         g = load_state(GUARDIAN_STATE_FILE)
         resume_cfg = load_resume_config()
@@ -2733,9 +2740,9 @@ def main_console():
         ]
 
         render_dual_panels(
-            f"SAIA MASTER CONSOLE v23.5 | 旗舰穿透版 {spin_char}",
+            "SAIA MASTER CONSOLE v23.5 | 旗舰穿透版",
             left_lines,
-            f"MONITOR DETAIL | 运行细节 {spin_char}",
+            "MONITOR DETAIL | 运行细节",
             right_lines,
         )
 
@@ -2750,7 +2757,7 @@ def main_console():
         try:
             c = timed_input(
                 f"\n{C_BLUE}┌──({C_W}root@saia{C_BLUE})-[{C_W}~/menu{C_BLUE}]\n└─{C_WARN}# {C_W}",
-                timeout_sec=1.0,
+                timeout_sec=10.0,
             ).strip()
         except KeyboardInterrupt:
             print(f"\n{C_DIM}已取消输入，返回主菜单刷新...{C_W}")
@@ -2813,15 +2820,29 @@ def main_console():
 
         elif c == "2":
             while True:
+                if poll_zero_to_back(0.05):
+                    break
                 st = load_state(STATE_FILE)
                 spin_char = spinner[spin_idx % len(spinner)]
                 spin_idx += 1
                 done = st.get("done", 0)
                 total = st.get("total", 0)
                 bar = render_progress_bar(done, total)
-                _, xui_verified, _, s5_verified = collect_report_sections(limit=None)
-                xui_recent = [format_result_line(l, "xui") for l in xui_verified[-3:]]
-                s5_recent = [format_result_line(l, "socks5") for l in s5_verified[-3:]]
+                recent_lines = list(st.get("recent", []))
+                xui_recent_raw = [
+                    l
+                    for l in recent_lines
+                    if "[XUI_VERIFIED]" in l or "[高危-后台沦陷]" in l
+                ]
+                s5_recent_raw = [
+                    l
+                    for l in recent_lines
+                    if "[S5_VERIFIED]" in l or "[优质-真穿透]" in l
+                ]
+                xui_recent = [format_result_line(l, "xui") for l in xui_recent_raw[-3:]]
+                s5_recent = [
+                    format_result_line(l, "socks5") for l in s5_recent_raw[-3:]
+                ]
 
                 cur_service = str(st.get("current_service", "-"))
                 cur_ip = str(st.get("current_ip", "-"))
@@ -2868,7 +2889,7 @@ def main_console():
                 print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
                 print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
                 print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
-                if poll_zero_to_back(0.5):
+                if poll_zero_to_back(0.35):
                     break
 
         elif c == "3":
