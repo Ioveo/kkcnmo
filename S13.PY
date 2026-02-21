@@ -1444,10 +1444,8 @@ def poll_zero_to_back(timeout_sec=0.5):
                     if msvcrt.kbhit():
                         msvcrt.getwch()
                     continue
-                if ch == "0":
-                    return True
                 if ch in ("\r", "\n"):
-                    continue
+                    return True
             else:
                 time.sleep(0.05)
         return False
@@ -1459,7 +1457,7 @@ def poll_zero_to_back(timeout_sec=0.5):
         raw = sys.stdin.readline().strip()
     except Exception:
         return False
-    return raw == "0"
+    return raw == ""
 
 
 def poll_action_key(timeout_sec=0.5, keys=("0",)):
@@ -1496,11 +1494,11 @@ def poll_action_key(timeout_sec=0.5, keys=("0",)):
     return raw if raw in allowed else None
 
 
-def wait_for_zero_return(prompt="输入 0 返回主菜单: "):
+def wait_for_zero_return(prompt="回车返回主菜单: "):
     while True:
-        if input(prompt).strip() == "0":
+        if input(prompt).strip() == "":
             return
-        print("请输入 0 返回。")
+        print("请直接回车返回。")
 
 
 def get_available_memory_mb():
@@ -1971,7 +1969,12 @@ async def audit_xui(
             save_state(STATE_FILE, verify_state_snapshot)
         try:
             for proto, use_ssl, country, asn, login_path in found_candidates:
-                for u, p in tokens:
+                for idx, (u, p) in enumerate(tokens, start=1):
+                    async with state_lock:
+                        state["verify_line"] = (
+                            f"VERIFY {ip}:{port} {proto.upper()} "
+                            f"{idx}/{len(tokens)} user={u}"
+                        )
                     payload = f"username={urllib.parse.quote(u)}&password={urllib.parse.quote(p)}"
                     if token_sem is not None:
                         async with token_sem:
@@ -1995,6 +1998,8 @@ async def audit_xui(
                 state["verifying_ip_count"] = max(
                     0, state.get("verifying_ip_count", 0) - 1
                 )
+                if state.get("verifying_ip_count", 0) <= 0:
+                    state["verify_line"] = "-"
                 verify_state_snapshot = dict(state)
             if verify_state_snapshot is not None:
                 save_state(STATE_FILE, verify_state_snapshot)
@@ -2085,9 +2090,14 @@ async def audit_socks5(
             if verify_state_snapshot is not None:
                 save_state(STATE_FILE, verify_state_snapshot)
             try:
-                for u, p in tokens:
+                for idx, (u, p) in enumerate(tokens, start=1):
                     w3 = None
                     try:
+                        async with state_lock:
+                            state["verify_line"] = (
+                                f"VERIFY {ip}:{port} S5-AUTH "
+                                f"{idx}/{len(tokens)} user={u}"
+                            )
                         async with conn_limiter:
                             r3, w3 = await asyncio.wait_for(
                                 asyncio.open_connection(ip, port), timeout=2.0
@@ -2159,6 +2169,8 @@ async def audit_socks5(
                     state["verifying_ip_count"] = max(
                         0, state.get("verifying_ip_count", 0) - 1
                     )
+                    if state.get("verifying_ip_count", 0) <= 0:
+                        state["verify_line"] = "-"
                     verify_state_snapshot = dict(state)
                 if verify_state_snapshot is not None:
                     save_state(STATE_FILE, verify_state_snapshot)
@@ -2200,6 +2212,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "current_ip": "-",
         "current_service": "-",
         "current_port": "-",
+        "verify_line": "-",
         "work_mode": work_mode,
         "recent": [],
         "skipped_resume": 0,
@@ -2477,8 +2490,23 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         with open(token_file, "r", encoding="utf-8", errors="ignore") as f:
             for l in f:
                 l = l.strip()
-                if l:
-                    tokens.append(l.split(":", 1) if ":" in l else ["admin", l])
+                if (not l) or l.startswith("#"):
+                    continue
+                if ":" in l:
+                    u, p = l.split(":", 1)
+                    u = u.strip()
+                    p = p.strip()
+                    if (not u) and (not p):
+                        continue
+                    if not u:
+                        u = "admin"
+                    if not p:
+                        continue
+                    tokens.append([u, p])
+                else:
+                    p = l.strip()
+                    if p:
+                        tokens.append(["admin", p])
     async with state_lock:
         state["tokens_loaded"] = len(tokens)
 
@@ -2746,7 +2774,7 @@ def main_console():
     spin_idx = 0
     panel_inner = 74
     panel_border = C_BLUE
-    panel_rows = 8
+    panel_rows = 9
 
     def visible_width(text):
         clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -2893,6 +2921,7 @@ def main_console():
             f"{C_W}PID:{C_CYAN}{int(s.get('pid', 0) or 0)}{C_W} {panel_border}| {C_W}队列深度:{C_CYAN}{queue_size}{C_W} {panel_border}| {C_W}喂入间隔:{C_CYAN}{feed_interval:.3f}s{C_W}",
             f"{C_W}扫描目标 IP:{C_CYAN}{current_ip}{C_W}",
             f"{C_W}扫描服务:{C_CYAN}{current_service}{C_W} {panel_border}| {C_W}当前端口:{C_CYAN}{current_port}{C_W}",
+            f"{C_W}验真读取:{C_CYAN}{str(s.get('verify_line', '-'))[:58]}{C_W}",
             f"{C_W}端口装载 XUI:{C_CYAN}{xui_ports_total}{C_W} {panel_border}| {C_W}S5:{C_CYAN}{s5_ports_total}{C_W}",
             f"{C_W}字典口令加载:{C_CYAN}{tokens_loaded}{C_W} 条",
             f"{C_W}跳过统计 断点:{C_CYAN}{skipped_resume}{C_W} {panel_border}| 历史:{C_CYAN}{skipped_history}{C_W}",
@@ -2909,7 +2938,7 @@ def main_console():
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
         print(f" 1) 启动审计             2) 监控面板             3) X-UI审计/验真")
         print(f" 4) 查看日志             5) 停止审计             6) 启动守护")
-        print(f" 7) 断点续连             8) 停止守护             9) 退出系统")
+        print(f" 7) 断点续连             8) 停止守护             0) 退出系统")
         print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
         print(f"13) 分类清理结果        14) 疑似无L7列表        15) 一键清理")
         print(f"16) 更换IP列表          17) 更新Tokens          18) 守护诊断")
@@ -3014,8 +3043,12 @@ def main_console():
                 cur_action = str(st.get("current", "-"))
                 if len(cur_action) > 24:
                     cur_action = cur_action[:24]
+                verify_line = str(st.get("verify_line", "-"))
+                if len(verify_line) > 48:
+                    verify_line = verify_line[:48]
 
-                os.system("cls" if os.name == "nt" else "clear")
+                sys.stdout.write("\x1b[H\x1b[J")
+                sys.stdout.flush()
                 print(
                     f"{C_BLUE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{C_W}"
                 )
@@ -3040,6 +3073,7 @@ def main_console():
                 print(
                     f"{C_BLUE}┃ {C_W}当前动作   {C_BLUE}|{C_DIM} {cur_action:<24} 验证中:{st.get('verifying_ip_count', 0):<4} {C_BLUE}┃{C_W}"
                 )
+                print(f"{C_BLUE}┃ {C_W}{verify_line:<56}{C_BLUE}┃{C_W}")
                 print(f"{C_BLUE}┃ {C_W}总体进度   {C_BLUE}|{C_W} {bar} {C_BLUE}┃{C_W}")
                 print(
                     f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
@@ -3048,7 +3082,7 @@ def main_console():
                 print("\n".join(xui_recent) if xui_recent else f"{C_DIM}-{C_W}")
                 print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
                 print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
-                print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                print(f"\n{C_DIM}回车返回主菜单...{C_W}")
                 if poll_zero_to_back(0.35):
                     break
 
@@ -3090,7 +3124,7 @@ def main_console():
                             if xui_verified
                             else f"{C_DIM}暂无X-UI验真数据{C_W}"
                         )
-                        print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                        print(f"\n{C_DIM}回车返回主菜单...{C_W}")
                     if poll_zero_to_back(0.5):
                         break
             except KeyboardInterrupt:
@@ -3100,7 +3134,7 @@ def main_console():
             output = read_last_lines(LOG_FILE, lines=50)
             print(f"\n{C_CYAN}>>> 系统日志{C_W}\n")
             print(output if output else f"{C_DIM}暂无日志{C_W}")
-            wait_for_zero_return(f"\n{C_BLUE}输入 0 返回...{C_W}")
+            wait_for_zero_return(f"\n{C_BLUE}回车返回...{C_W}")
 
         elif c == "5":
             disable_and_stop_guardian_processes()
@@ -3161,8 +3195,8 @@ def main_console():
             print(f"已扫跳过: {'启用' if rcfg.get('skip_scanned', False) else '关闭'}")
             print("1) 开启续连  2) 关闭续连  3) 清空断点")
             print("4) 开启已扫跳过  5) 关闭已扫跳过")
-            sel = input("请选择 (输入 0 返回): ").strip()
-            if sel == "0":
+            sel = input("请选择 (回车返回): ").strip()
+            if sel == "":
                 continue
             if sel == "1":
                 rcfg["enabled"] = True
@@ -3193,7 +3227,7 @@ def main_console():
             print(
                 f"当前: 触发阈值={fcfg.get('accel_trigger_ratio', 0.5):.2f} | 冲刺阈值={fcfg.get('final_rush_ratio', 0.1):.2f} | 加速系数={fcfg.get('accel_factor', 0.5):.2f}"
             )
-            print("输入 0 返回主菜单，留空表示保持当前值")
+            print("回车保持当前值，如需返回请按 Ctrl+C")
 
             raw_trigger = input("触发阈值(0-1, 默认0.50): ").strip()
             if raw_trigger == "0":
@@ -3236,7 +3270,7 @@ def main_console():
             print(
                 f"当前状态: {'启用' if cfg.get('enabled') else '关闭'} | 条件: {telegram_condition_label(cfg.get('condition_mode', 2))} | 定时: {cfg.get('interval_minutes', 0)} 分钟 | 验真阈值: {cfg.get('verified_threshold', 5)}"
             )
-            print("输入 0 返回主菜单，留空表示保持当前值")
+            print("回车保持当前值，如需返回请按 Ctrl+C")
             token = input("Bot Token: ").strip()
             if token == "0":
                 continue
@@ -3301,7 +3335,7 @@ def main_console():
                 print(f"{C_DIM}没有运行中的守护{C_W}")
             time.sleep(1)
 
-        elif c == "9":
+        elif c in ("0", "9"):
             break
         elif c == "11":
             try:
@@ -3341,7 +3375,7 @@ def main_console():
                             if s5_verified
                             else f"{C_DIM}暂无S5验真数据{C_W}"
                         )
-                        print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
+                        print(f"\n{C_DIM}回车返回主菜单...{C_W}")
                     if poll_zero_to_back(0.5):
                         break
             except KeyboardInterrupt:
@@ -3352,8 +3386,8 @@ def main_console():
             print("1) 清理 XUI")
             print("2) 清理 S5")
             print("3) 清理 蜜罐")
-            sel = input("请选择 (输入 0 返回): ").strip()
-            if sel == "0":
+            sel = input("请选择 (回车返回): ").strip()
+            if sel == "":
                 continue
             if sel not in ("1", "2", "3"):
                 print(f"{C_WARN}无效选项{C_W}")
@@ -3378,7 +3412,7 @@ def main_console():
                 print("\n".join(format_result_line(x, "socks5") for x in rows))
             else:
                 print(f"{C_DIM}暂无疑似无L7数据{C_W}")
-            wait_for_zero_return(f"\n{C_BLUE}输入 0 返回...{C_W}")
+            wait_for_zero_return(f"\n{C_BLUE}回车返回...{C_W}")
 
         elif c == "15":
             print(f"\n{C_WARN}>>> 一键清理将停止审计/守护并删除运行文件{C_W}")
