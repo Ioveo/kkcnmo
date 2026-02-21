@@ -606,6 +606,13 @@ def disable_and_stop_guardian_processes():
         stopped_any = True
     if stop_guardian_processes_fallback() > 0:
         stopped_any = True
+    gs = load_state(GUARDIAN_STATE_FILE)
+    if isinstance(gs, dict):
+        gs["status"] = "stopped"
+        gs["pid"] = 0
+        gs["updated_at"] = now_ts()
+        gs["last_note"] = "disabled_by_user"
+        save_state(GUARDIAN_STATE_FILE, gs)
     return stopped_any
 
 
@@ -1000,7 +1007,6 @@ def stop_process(pid):
 
 def stop_guardian_processes_fallback():
     killed = 0
-    this_file = os.path.abspath(__file__).lower()
 
     if os.name == "nt":
         try:
@@ -1017,8 +1023,6 @@ def stop_guardian_processes_fallback():
                 low = raw.lower()
                 if "guardian" not in low:
                     continue
-                if os.path.basename(this_file) not in low:
-                    continue
                 parts = [x.strip() for x in raw.split(",") if x.strip()]
                 if not parts:
                     continue
@@ -1030,6 +1034,34 @@ def stop_guardian_processes_fallback():
                     killed += 1
         except (OSError, subprocess.CalledProcessError):
             pass
+
+        try:
+            ps_cmd = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -match 'guardian' } | "
+                "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+            )
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if out:
+                try:
+                    rows = json.loads(out)
+                except json.JSONDecodeError:
+                    rows = []
+                if isinstance(rows, dict):
+                    rows = [rows]
+                for row in rows:
+                    cmdline = str(row.get("CommandLine", "")).lower()
+                    if "guardian" not in cmdline:
+                        continue
+                    pid = int(row.get("ProcessId", 0) or 0)
+                    if pid > 0 and stop_process(pid):
+                        killed += 1
+        except (OSError, ValueError, TypeError, subprocess.CalledProcessError):
+            pass
         return killed
 
     try:
@@ -1037,8 +1069,6 @@ def stop_guardian_processes_fallback():
         for raw in out.splitlines():
             low = raw.lower()
             if " guardian" not in low:
-                continue
-            if os.path.basename(this_file) not in low:
                 continue
             seg = raw.strip().split(None, 1)
             if not seg or not seg[0].isdigit():
@@ -1583,18 +1613,16 @@ def run_guardian(
     check_interval=20,
     min_free_mb=256.0,
 ):
-    tg_cfg = load_telegram_config()
-    tg_enabled = (
-        tg_cfg.get("enabled")
-        and bool(tg_cfg.get("bot_token"))
-        and bool(tg_cfg.get("chat_id"))
-    )
-
     def guardian_tg_push(text):
-        if not tg_enabled:
+        cfg = load_telegram_config()
+        if not (
+            cfg.get("enabled")
+            and bool(cfg.get("bot_token"))
+            and bool(cfg.get("chat_id"))
+        ):
             return
         ok, detail = send_telegram_message(
-            tg_cfg.get("bot_token", ""), tg_cfg.get("chat_id", ""), text
+            cfg.get("bot_token", ""), cfg.get("chat_id", ""), text
         )
         if not ok:
             log_event(f"Guardian Telegram failed: {detail}")
@@ -2648,8 +2676,7 @@ def main_console():
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    if not is_guardian_enabled():
-        disable_and_stop_guardian_processes()
+    disable_and_stop_guardian_processes()
 
     while True:
         sys.stdout.write("\x1b[H\x1b[J")
