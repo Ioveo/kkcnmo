@@ -585,6 +585,48 @@ def one_key_cleanup():
     return stopped, removed
 
 
+def reload_running_audit():
+    st = load_state(STATE_FILE)
+    pid = int(st.get("pid", 0) or 0)
+    if not is_alive(pid):
+        return False, "当前没有运行中的审计进程"
+
+    try:
+        mode = int(st.get("mode", 0))
+        work_mode = int(st.get("work_mode", 0))
+        threads = int(st.get("threads", 0))
+        ports_raw = str(st.get("ports_raw", "")).strip()
+        feed_int = float(st.get("feed_interval", 0.02))
+    except (TypeError, ValueError):
+        return False, "当前任务参数不完整，无法重载"
+
+    ports = parse_ports(ports_raw)
+    if mode not in (1, 2, 3) or work_mode not in (1, 2, 3) or threads < 1 or not ports:
+        return False, "当前任务参数无效，无法重载"
+
+    if not stop_process(pid):
+        return False, f"停止旧进程失败(PID {pid})"
+
+    deadline = time.time() + 5.0
+    while is_alive(pid) and time.time() < deadline:
+        time.sleep(0.1)
+
+    subprocess.Popen(
+        [
+            sys.executable,
+            __file__,
+            "run",
+            str(mode),
+            str(work_mode),
+            str(threads),
+            ports_raw,
+            str(feed_int),
+        ],
+        start_new_session=True,
+    )
+    return True, f"已重载，模式:{mode_label(mode)} 线程:{threads}"
+
+
 def write_list_file_from_input(file_path, split_spaces=True):
     print("请输入内容，单独输入 EOF 结束:")
     rows = []
@@ -1821,10 +1863,13 @@ async def audit_socks5(
 
 
 async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
+    ports_raw = ",".join(str(p) for p in ports)
     state = {
         "status": "running",
         "pid": os.getpid(),
         "mode": mode,
+        "threads": threads,
+        "ports_raw": ports_raw,
         "total": 0,
         "done": 0,
         "fed": 0,
@@ -2500,7 +2545,7 @@ def main_console():
         ]
 
         render_dual_panels(
-            "SAIA MASTER CONSOLE v23.5 | 旗舰穿透版",
+            "SAIA MASTER CONSOLE v23.5 | 天才猫究极版",
             left_lines,
             "MONITOR DETAIL | 运行细节",
             right_lines,
@@ -2971,6 +3016,13 @@ def main_console():
                 print(f"{C_WARN}>>> 写入失败或已取消{C_W}")
             else:
                 print(f"{C_SUCC}>>> IP 列表已更新，共 {count} 条{C_W}")
+                reload_now = input("是否立即重载当前审计任务? (y/n): ").strip().lower()
+                if reload_now == "y":
+                    ok, detail = reload_running_audit()
+                    if ok:
+                        print(f"{C_SUCC}>>> {detail}{C_W}")
+                    else:
+                        print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
             time.sleep(1.2)
 
         elif c == "17":
@@ -2983,6 +3035,13 @@ def main_console():
                 print(f"{C_WARN}>>> 写入失败或已取消{C_W}")
             else:
                 print(f"{C_SUCC}>>> Tokens 已更新，共 {count} 条{C_W}")
+                reload_now = input("是否立即重载当前审计任务? (y/n): ").strip().lower()
+                if reload_now == "y":
+                    ok, detail = reload_running_audit()
+                    if ok:
+                        print(f"{C_SUCC}>>> {detail}{C_W}")
+                    else:
+                        print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
             time.sleep(1.2)
 
 
