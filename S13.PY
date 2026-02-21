@@ -12,6 +12,7 @@ import ctypes
 import ssl
 import re
 import shutil
+import platform
 import unicodedata
 import select
 import traceback
@@ -929,11 +930,21 @@ def telegram_condition_label(mode):
 def send_telegram_message(bot_token, chat_id, text):
     if not bot_token or not chat_id:
         return False, "missing token/chat_id"
+
+    host = platform.node() or "unknown-host"
+    script = os.path.basename(__file__)
+    source_tag = f"[SRC {host} | PID:{os.getpid()} | {script}]"
+    msg = (text or "").strip()
+    if msg:
+        msg = f"{msg}\n\n{source_tag}"
+    else:
+        msg = source_tag
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = urllib.parse.urlencode(
         {
             "chat_id": chat_id,
-            "text": text[:3800],
+            "text": msg[:3800],
             "disable_web_page_preview": "true",
         }
     ).encode("utf-8")
