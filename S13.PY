@@ -17,6 +17,7 @@ import select
 import traceback
 import urllib.parse
 import urllib.request
+import gc
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -284,6 +285,86 @@ def collect_report_sections(limit=None):
     return xui_audited, xui_verified, s5_audited, s5_verified
 
 
+def load_all_report_lines():
+    lines = []
+    report_paths = []
+    for i in range(REPORT_BACKUPS, 0, -1):
+        p = f"{REPORT_FILE}.{i}"
+        if os.path.exists(p):
+            report_paths.append(p)
+    if os.path.exists(REPORT_FILE):
+        report_paths.append(REPORT_FILE)
+
+    for rp in report_paths:
+        try:
+            with open(rp, "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    if line:
+                        lines.append(line)
+        except OSError:
+            continue
+    return lines
+
+
+def save_report_lines(lines):
+    clear_report_history()
+    if not lines:
+        return
+    try:
+        with open(REPORT_FILE, "a", encoding="utf-8") as f:
+            for line in lines:
+                if line:
+                    f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def clear_report_by_category(category):
+    lines = load_all_report_lines()
+    if not lines:
+        return 0
+
+    kept = []
+    removed = 0
+    for line in lines:
+        is_xui_audited, _, is_s5_audited, _ = classify_report_line(line)
+        low = line.lower()
+        is_honeypot = (
+            "蜜罐" in line
+            or "honeypot" in low
+            or "canary" in low
+            or "trap" in low
+            or "诱捕" in line
+        )
+
+        should_remove = False
+        if category == "xui":
+            should_remove = is_xui_audited
+        elif category == "s5":
+            should_remove = is_s5_audited
+        elif category == "honeypot":
+            should_remove = is_honeypot
+
+        if should_remove:
+            removed += 1
+        else:
+            kept.append(line)
+
+    save_report_lines(kept)
+    return removed
+
+
+def collect_suspected_no_l7(limit=None):
+    rows = []
+    for line in load_all_report_lines():
+        if "无L7能力" in line or "疑似无L7" in line:
+            rows.append(line)
+    if isinstance(limit, int) and limit > 0:
+        return rows[-limit:]
+    return rows
+
+
 def merge_recent_lines(base_lines, recent_lines, limit=None):
     out = list(base_lines)
     seen = set(out)
@@ -342,7 +423,7 @@ def classify_report_line(line):
     return is_xui_audited, is_xui_verified, is_s5_audited, is_s5_verified
 
 
-def to_ip_port_user_pass(line):
+def parse_ip_port_user_pass(line):
     ip_port = "-"
     user = "-"
     pwd = "-"
@@ -369,7 +450,7 @@ def to_ip_port_user_pass(line):
             user = m_old.group(1)
             pwd = m_old.group(2)
 
-    return f"{ip_port}:{user}:{pwd}"
+    return ip_port, user, pwd
 
 
 def extract_country_asn(line):
@@ -392,10 +473,28 @@ def extract_country_asn(line):
     return country, asn
 
 
+def extract_rtt_ms(line):
+    m = re.search(r"\brtt\s*[:：]\s*(\d+)\s*ms\b", line, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def is_verified_output_line(line):
+    return (
+        "[XUI_VERIFIED]" in line
+        or "[高危-后台沦陷]" in line
+        or "[S5_VERIFIED]" in line
+        or "[优质-真穿透]" in line
+    )
+
+
 def format_result_line(line, service_tag):
-    base = to_ip_port_user_pass(line)
+    ip_port, user, pwd = parse_ip_port_user_pass(line)
     country, asn = extract_country_asn(line)
-    return f"{base} #{service_tag}|{country}，{asn}"
+    rtt = extract_rtt_ms(line)
+    suffix = f" RTT:{rtt} ms" if rtt else ""
+    return f"{user}:{pwd}@{ip_port} # {service_tag}| {country} {asn}{suffix}"
 
 
 def clear_report_history():
@@ -410,6 +509,115 @@ def clear_report_history():
                 os.remove(p)
         except OSError:
             pass
+
+
+def cleanup_runtime_files():
+    files_to_remove = [
+        STATE_FILE,
+        LOG_FILE,
+        REPORT_FILE,
+        GUARDIAN_STATE_FILE,
+        TELEGRAM_CFG_FILE,
+        RESUME_CFG_FILE,
+        FEED_CFG_FILE,
+        CHECKPOINT_FILE,
+        VERIFIED_EVENTS_FILE,
+        RUN_LOCK_FILE,
+    ]
+    removed = 0
+
+    for p in files_to_remove:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+
+    for i in range(1, LOG_BACKUPS + 1):
+        try:
+            p = f"{LOG_FILE}.{i}"
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+
+    for i in range(1, REPORT_BACKUPS + 1):
+        try:
+            p = f"{REPORT_FILE}.{i}"
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+
+    for i in range(1, VERIFIED_EVENTS_BACKUPS + 1):
+        try:
+            p = f"{VERIFIED_EVENTS_FILE}.{i}"
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+
+    return removed
+
+
+def one_key_cleanup():
+    pids = set()
+    for sf in (STATE_FILE, GUARDIAN_STATE_FILE):
+        st = load_state(sf)
+        pid = int(st.get("pid", 0) or 0) if isinstance(st, dict) else 0
+        if pid > 0:
+            pids.add(pid)
+    lock_pid = _read_lock_pid(RUN_LOCK_FILE)
+    if lock_pid > 0:
+        pids.add(lock_pid)
+
+    stopped = 0
+    for pid in sorted(pids):
+        if stop_process(pid):
+            stopped += 1
+
+    removed = cleanup_runtime_files()
+    gc.collect()
+    return stopped, removed
+
+
+def write_list_file_from_input(file_path, split_spaces=True):
+    print("请输入内容，单独输入 EOF 结束:")
+    rows = []
+    while True:
+        try:
+            raw = input()
+        except KeyboardInterrupt:
+            print("\n已取消输入。")
+            return None
+        if raw.strip() == "EOF":
+            break
+        if split_spaces:
+            parts = [x.strip() for x in raw.strip().split() if x.strip()]
+            rows.extend(parts)
+        else:
+            line = raw.strip()
+            if line:
+                rows.append(line)
+
+    tmp_path = file_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for x in rows:
+                f.write(x + "\n")
+        os.replace(tmp_path, file_path)
+        return len(rows)
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
 
 
 def latest_ip_port(lines):
@@ -600,9 +808,9 @@ def save_telegram_config(cfg):
 def telegram_condition_label(mode):
     return {
         0: "关闭条件推送",
-        1: "发现即推送",
+        1: "验真即推送",
         2: "仅验真推送",
-        3: "发现+验真推送",
+        3: "验真聚合推送",
         4: "完成或验真>=阈值(单次)",
     }.get(mode, str(mode))
 
@@ -1724,23 +1932,30 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         task.add_done_callback(lambda t: notify_tasks.discard(t))
 
     def should_push_condition(line):
-        is_verified = ("[高危-后台沦陷]" in line) or ("[优质-真穿透]" in line)
+        is_verified = is_verified_output_line(line)
         if tg_condition_mode == 0:
             return False
-        if tg_condition_mode in (1, 2, 3):
+        if tg_condition_mode in (1, 2, 3, 4):
             return is_verified
-        if tg_condition_mode == 4:
-            return False
         return False
 
-    def build_interval_message(snapshot, recent_lines):
+    def build_interval_message(snapshot, verified_lines):
+        xui_lines = [
+            format_result_line(x, "xui")
+            for x in verified_lines
+            if "[XUI_VERIFIED]" in x or "[高危-后台沦陷]" in x
+        ]
+        s5_lines = [
+            format_result_line(x, "socks5")
+            for x in verified_lines
+            if "[S5_VERIFIED]" in x or "[优质-真穿透]" in x
+        ]
         return (
             f"【天才猫】\n"
             f"模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n"
-            f"进度: {snapshot.get('done', 0)}/{snapshot.get('total', 0)}\n"
-            f"发现面板: XUI {snapshot.get('xui_found', 0)} | S5 {snapshot.get('s5_found', 0)}\n"
-            f"验真结果: XUI {snapshot.get('xui_verified', 0)} | S5 {snapshot.get('s5_verified', 0)}\n"
-            f"最新:\n" + ("\n".join(recent_lines) if recent_lines else "-")
+            f"验真成功: XUI {snapshot.get('xui_verified', 0)} | S5真穿透 {snapshot.get('s5_verified', 0)}\n"
+            f"XUI:\n" + ("\n".join(xui_lines[-5:]) if xui_lines else "-") + "\n\n"
+            f"S5:\n" + ("\n".join(s5_lines[-5:]) if s5_lines else "-")
         )
 
     def build_daily_verified_message(now_dt):
@@ -1809,7 +2024,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     and now - last_interval_push_ts >= tg_interval_sec
                     and state.get("total", 0) > 0
                 ):
-                    should_send_interval = True
+                    verified_recent = [
+                        x
+                        for x in list(state.get("recent", []))
+                        if is_verified_output_line(x)
+                    ]
+                    should_send_interval = bool(verified_recent)
                     snapshot = {
                         "done": state.get("done", 0),
                         "total": state.get("total", 0),
@@ -1818,7 +2038,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         "s5_found": state.get("s5_found", 0),
                         "s5_verified": state.get("s5_verified", 0),
                     }
-                    recent_lines = list(state.get("recent", []))[-5:]
+                    recent_lines = verified_recent[-5:]
                 if (
                     tg_enabled
                     and now_dt.hour == 9
@@ -2100,12 +2320,15 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
             "s5_found": state.get("s5_found", 0),
             "s5_verified": state.get("s5_verified", 0),
         }
-        final_recent = list(state.get("recent", []))[-5:]
+        final_recent = [
+            x for x in list(state.get("recent", [])) if is_verified_output_line(x)
+        ][-5:]
         if tg_condition_mode == 4:
-            if not special_or_sent:
+            if (not special_or_sent) and final_recent:
                 schedule_telegram(build_interval_message(final_snapshot, final_recent))
         else:
-            schedule_telegram(build_interval_message(final_snapshot, final_recent))
+            if final_recent:
+                schedule_telegram(build_interval_message(final_snapshot, final_recent))
     flush_stop.set()
     await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
     if notify_tasks:
@@ -2288,7 +2511,8 @@ def main_console():
         print(f" 4) 查看日志             5) 停止审计             6) 启动守护")
         print(f" 7) 断点续连             8) 停止守护             9) 退出系统")
         print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
-        print(f"13) 清空审计结果        14) 清空审计结果")
+        print(f"13) 分类清理结果        14) 疑似无L7列表        15) 一键清理")
+        print(f"16) 更换IP列表          17) 更新Tokens")
 
         try:
             c = timed_input(
@@ -2360,6 +2584,9 @@ def main_console():
                 done = st.get("done", 0)
                 total = st.get("total", 0)
                 bar = render_progress_bar(done, total)
+                _, xui_verified, _, s5_verified = collect_report_sections(limit=None)
+                xui_recent = [format_result_line(l, "xui") for l in xui_verified[-3:]]
+                s5_recent = [format_result_line(l, "socks5") for l in s5_verified[-3:]]
                 spin_char = spinner[spin_idx % len(spinner)]
                 spin_idx += 1
 
@@ -2392,6 +2619,10 @@ def main_console():
                 print(
                     f"{C_BLUE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{C_W}"
                 )
+                print(f"\n{C_CYAN}[已验真结果 - XUI]{C_W}")
+                print("\n".join(xui_recent) if xui_recent else f"{C_DIM}-{C_W}")
+                print(f"\n{C_CYAN}[已验真结果 - S5真穿透]{C_W}")
+                print("\n".join(s5_recent) if s5_recent else f"{C_DIM}-{C_W}")
                 print(f"\n{C_DIM}输入 0 返回主菜单...{C_W}")
                 if poll_zero_to_back(0.5):
                     break
@@ -2582,7 +2813,7 @@ def main_console():
                 continue
             interval_raw = input("定时推送间隔分钟 (0=关闭, 默认保持): ").strip()
             cond_raw = input(
-                "条件推送 (0关闭/1发现即推/2仅验真/3发现+验真/4完成或验真>=阈值(单次), 默认保持): "
+                "条件推送 (0关闭/1验真即推/2仅验真/3验真聚合/4完成或验真>=阈值(单次), 默认保持): "
             ).strip()
             th_raw = input("验真阈值 (默认5, 仅模式4生效, 默认保持): ").strip()
             test_raw = input("保存后发送测试消息? (y/n): ").strip().lower()
@@ -2681,16 +2912,78 @@ def main_console():
             except KeyboardInterrupt:
                 pass
 
-        elif c in ("13", "14"):
-            sure = input("确认清空审计结果历史? (y/n): ").strip().lower()
+        elif c == "13":
+            print(f"\n{C_CYAN}>>> 分类清理审计结果{C_W}")
+            print("1) 清理 XUI")
+            print("2) 清理 S5")
+            print("3) 清理 蜜罐")
+            sel = input("请选择 (输入 0 返回): ").strip()
+            if sel == "0":
+                continue
+            if sel not in ("1", "2", "3"):
+                print(f"{C_WARN}无效选项{C_W}")
+                time.sleep(1)
+                continue
+            sure = input("确认执行? (y/n): ").strip().lower()
+            if sure != "y":
+                print(f"{C_DIM}已取消{C_W}")
+                time.sleep(1)
+                continue
+            category = {"1": "xui", "2": "s5", "3": "honeypot"}[sel]
+            removed = clear_report_by_category(category)
+            print(f"{C_SUCC}>>> 清理完成，移除 {removed} 条{C_W}")
+            time.sleep(1.2)
+
+        elif c == "14":
+            rows = collect_suspected_no_l7(limit=None)
+            os.system("cls" if os.name == "nt" else "clear")
+            print(f"\n{C_CYAN}>>> 疑似无L7能力列表{C_W}")
+            print(f"总数: {C_CYAN}{len(rows)}{C_W}\n")
+            if rows:
+                print("\n".join(format_result_line(x, "socks5") for x in rows))
+            else:
+                print(f"{C_DIM}暂无疑似无L7数据{C_W}")
+            wait_for_zero_return(f"\n{C_BLUE}输入 0 返回...{C_W}")
+
+        elif c == "15":
+            print(f"\n{C_WARN}>>> 一键清理将停止审计/守护并删除运行文件{C_W}")
+            print(
+                f"{C_DIM}仅保留 IP 文件与 tokens 文件（如 nodes.list/ip.txt/pass.txt）{C_W}"
+            )
+            sure = input("确认执行? (y/n): ").strip().lower()
             if sure == "0":
                 continue
             if sure == "y":
-                clear_report_history()
-                print(f"{C_SUCC}>>> 审计结果历史已清空{C_W}")
+                stopped, removed = one_key_cleanup()
+                print(
+                    f"{C_SUCC}>>> 清理完成: 停止进程 {stopped} 个, 删除文件 {removed} 个{C_W}"
+                )
             else:
                 print(f"{C_DIM}已取消{C_W}")
-            time.sleep(1)
+            time.sleep(1.2)
+
+        elif c == "16":
+            print(f"\n{C_CYAN}>>> 更换 IP 列表 ({NODE_FILE}){C_W}")
+            print(f"{C_DIM}支持空格/换行混合输入，保存后自动按一行一个目标整理{C_W}")
+            print(f"{C_DIM}示例: 1.1.1.1 2.2.2.2/24 3.3.3.3-3.3.3.9{C_W}")
+            count = write_list_file_from_input(NODE_FILE, split_spaces=True)
+            if count is None:
+                print(f"{C_WARN}>>> 写入失败或已取消{C_W}")
+            else:
+                print(f"{C_SUCC}>>> IP 列表已更新，共 {count} 条{C_W}")
+            time.sleep(1.2)
+
+        elif c == "17":
+            print(f"\n{C_CYAN}>>> 更新 Tokens ({TOKEN_FILE}){C_W}")
+            print(
+                f"{C_DIM}支持空格/换行混合输入，格式示例: admin:admin  root:123456{C_W}"
+            )
+            count = write_list_file_from_input(TOKEN_FILE, split_spaces=True)
+            if count is None:
+                print(f"{C_WARN}>>> 写入失败或已取消{C_W}")
+            else:
+                print(f"{C_SUCC}>>> Tokens 已更新，共 {count} 条{C_W}")
+            time.sleep(1.2)
 
 
 if __name__ == "__main__":
