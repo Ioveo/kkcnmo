@@ -2473,9 +2473,6 @@ def main_console():
         worker_bar = render_progress_bar(worker_done, feed_total, width=24)
         progress_ratio = (worker_done / feed_total) if feed_total > 0 else 0.0
         progress_pct = progress_ratio * 100.0
-        ip_bar_width = 24
-        ip_bar_fill = int(ip_bar_width * max(0.0, min(1.0, progress_ratio)))
-        ip_bar = "#" * ip_bar_fill + "-" * (ip_bar_width - ip_bar_fill)
         active_workers = int(s.get("active_workers", 0))
         socket_limit = int(s.get("socket_limit", 0))
         socket_in_use = int(s.get("socket_in_use", 0))
@@ -2525,9 +2522,9 @@ def main_console():
         left_lines = [
             f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}",
             f"{C_W}解析:{C_CYAN}{total}{C_W} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{feed_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}",
-            f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{feed_total} ({C_CYAN}{progress_pct:5.1f}%{C_W}) [{C_PROC}{ip_bar}{C_W}]",
-            f"{C_W}全体进度(含跳过):{parse_bar}  跳过:{C_CYAN}{skipped_total}{C_W}",
-            f"{C_W}投喂进度条:{worker_bar}",
+            f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{feed_total} ({C_CYAN}{progress_pct:5.1f}%{C_W})",
+            f"{C_W}全体进度(含跳过): {parse_bar}  跳过:{C_CYAN}{skipped_total}{C_W}",
+            f"{C_W}投喂进度条      : {worker_bar}",
             f"{C_W}XUI 已审计:{C_CYAN}{xui_audited}{C_W} / 已验真:{C_CYAN}{xui_verified}{C_W} {panel_border}| {C_W}S5 已审计:{C_CYAN}{s5_audited}{C_W} / 已验真:{C_CYAN}{s5_verified}{C_W} {panel_border}| {C_W}验证中:{C_CYAN}{verifying_now}",
             f"{C_W}Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit} {panel_border}| {C_W}CPU:{C_CYAN}{cpu_text}{C_W} {panel_border}| {C_W}内存:{C_CYAN}{mem_text}{C_W}",
             f"{C_W}当前:{C_DIM}{current}{C_W}",
@@ -2545,7 +2542,7 @@ def main_console():
         ]
 
         render_dual_panels(
-            "SAIA MASTER CONSOLE v23.5 | 天才猫究极版",
+            "SAIA MASTER CONSOLE v23.5 | 旗舰穿透版",
             left_lines,
             "MONITOR DETAIL | 运行细节",
             right_lines,
