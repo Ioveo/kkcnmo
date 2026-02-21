@@ -1526,8 +1526,12 @@ def run_guardian(
     )
     last_restart_ts = 0.0
     min_restart_gap = max(10.0, float(check_interval))
+    crash_restart_delay = 60.0
     completed_notice_logged = False
+    manual_stop_notice_logged = False
     notified_dead_pid = None
+    pending_dead_pid = None
+    pending_dead_since = 0.0
     while True:
         mem_mb = get_available_memory_mb()
         st = load_state(STATE_FILE)
@@ -1550,14 +1554,40 @@ def run_guardian(
                 save_state(GUARDIAN_STATE_FILE, gs)
                 time.sleep(check_interval)
                 continue
+
+            if st_status in ("manual_stopped", "stopped_manual"):
+                if not manual_stop_notice_logged:
+                    log_event(
+                        "Guardian idle: audit stopped manually, waiting manual restart"
+                    )
+                    guardian_tg_push(
+                        "【天才猫】\n守护待机\n检测到手动停止，不自动拉起；等待手动启动"
+                    )
+                    manual_stop_notice_logged = True
+                gs = load_state(GUARDIAN_STATE_FILE)
+                gs["updated_at"] = now_ts()
+                gs["last_free_mb"] = mem_mb
+                gs["last_note"] = "idle_manual_stop"
+                save_state(GUARDIAN_STATE_FILE, gs)
+                time.sleep(check_interval)
+                continue
+
+            if dead_pid != pending_dead_pid:
+                pending_dead_pid = dead_pid
+                pending_dead_since = now_ts()
+                if dead_pid and dead_pid != notified_dead_pid:
+                    guardian_tg_push(
+                        f"【天才猫】\n审计进程异常退出\nPID: {dead_pid}\n状态: {st_status or '-'}\n将在 60 秒后尝试重启"
+                    )
+                    notified_dead_pid = dead_pid
+
             if mem_mb is None or mem_mb >= min_free_mb:
                 now = now_ts()
-                if now - last_restart_ts >= min_restart_gap:
-                    if dead_pid and dead_pid != notified_dead_pid:
-                        guardian_tg_push(
-                            f"【天才猫】\n审计进程异常退出\nPID: {dead_pid}\n状态: {st_status or '-'}\n守护准备重启"
-                        )
-                        notified_dead_pid = dead_pid
+                if (
+                    pending_dead_since > 0
+                    and now - pending_dead_since >= crash_restart_delay
+                    and now - last_restart_ts >= min_restart_gap
+                ):
                     subprocess.Popen(
                         [
                             sys.executable,
@@ -1576,13 +1606,19 @@ def run_guardian(
                         f"【天才猫】\n守护已重启审计进程\n模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n线程: {threads}"
                     )
                     completed_notice_logged = False
+                    manual_stop_notice_logged = False
+                    pending_dead_pid = None
+                    pending_dead_since = 0.0
             else:
                 log_event(
                     f"Guardian wait: low memory {mem_mb:.0f}MB < {min_free_mb:.0f}MB"
                 )
         else:
             completed_notice_logged = False
+            manual_stop_notice_logged = False
             notified_dead_pid = None
+            pending_dead_pid = None
+            pending_dead_since = 0.0
         gs = load_state(GUARDIAN_STATE_FILE)
         gs["updated_at"] = now_ts()
         gs["last_free_mb"] = mem_mb
@@ -2785,6 +2821,12 @@ def main_console():
         elif c == "5":
             pid = load_state(STATE_FILE).get("pid")
             if stop_process(pid):
+                st = load_state(STATE_FILE)
+                if isinstance(st, dict):
+                    st["status"] = "manual_stopped"
+                    st["current"] = "Stopped manually"
+                    st["updated_at"] = now_ts()
+                    save_state(STATE_FILE, st)
                 print(f"{C_WARN}>>> 审计任务已强制停止{C_W}")
             else:
                 print(f"{C_DIM}没有运行中的任务{C_W}")
