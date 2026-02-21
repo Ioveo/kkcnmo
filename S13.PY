@@ -751,6 +751,7 @@ def default_telegram_config():
         "enabled": False,
         "bot_token": "",
         "chat_id": "",
+        "guardian_notify": False,
         "interval_minutes": 0,
         "condition_mode": 2,
         "verified_threshold": 5,
@@ -892,6 +893,7 @@ def load_telegram_config():
     if isinstance(data, dict):
         cfg.update(data)
     cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["guardian_notify"] = bool(cfg.get("guardian_notify", False))
     cfg["bot_token"] = str(cfg.get("bot_token", "")).strip()
     cfg["chat_id"] = str(cfg.get("chat_id", "")).strip()
     try:
@@ -1104,6 +1106,62 @@ def stop_guardian_processes_fallback():
     except (OSError, subprocess.CalledProcessError):
         pass
     return killed
+
+
+def list_guardian_processes_detail():
+    rows = []
+    seen = set()
+
+    if os.name == "nt":
+        try:
+            ps_cmd = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -match 'guardian' } | "
+                "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
+            )
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if out:
+                try:
+                    data = json.loads(out)
+                except json.JSONDecodeError:
+                    data = []
+                if isinstance(data, dict):
+                    data = [data]
+                for item in data:
+                    pid = int(item.get("ProcessId", 0) or 0)
+                    if pid <= 0 or pid in seen:
+                        continue
+                    seen.add(pid)
+                    name = str(item.get("Name", "-"))
+                    cmd = str(item.get("CommandLine", "")).strip()
+                    rows.append((pid, name, cmd))
+        except (OSError, ValueError, TypeError, subprocess.CalledProcessError):
+            pass
+        return sorted(rows, key=lambda x: x[0])
+
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,comm,args"], text=True)
+        for raw in out.splitlines():
+            low = raw.lower()
+            if "guardian" not in low:
+                continue
+            parts = raw.strip().split(None, 2)
+            if len(parts) < 2 or (not parts[0].isdigit()):
+                continue
+            pid = int(parts[0])
+            if pid <= 0 or pid in seen:
+                continue
+            seen.add(pid)
+            name = parts[1]
+            cmd = parts[2] if len(parts) > 2 else ""
+            rows.append((pid, name, cmd))
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return sorted(rows, key=lambda x: x[0])
 
 
 def _read_lock_pid(lock_file):
@@ -1645,6 +1703,7 @@ def run_guardian(
         cfg = load_telegram_config()
         if not (
             cfg.get("enabled")
+            and cfg.get("guardian_notify")
             and bool(cfg.get("bot_token"))
             and bool(cfg.get("chat_id"))
         ):
@@ -1685,104 +1744,108 @@ def run_guardian(
     pending_dead_pid = None
     pending_dead_since = 0.0
     while True:
-        if not is_guardian_enabled():
-            gs = load_state(GUARDIAN_STATE_FILE)
-            gs["status"] = "stopped"
-            gs["last_note"] = "disabled_by_user"
-            gs["updated_at"] = now_ts()
-            save_state(GUARDIAN_STATE_FILE, gs)
-            break
-        mem_mb = get_available_memory_mb()
-        st = load_state(STATE_FILE)
-        if not is_alive(st.get("pid")):
-            dead_pid = st.get("pid")
-            st_status = str(st.get("status", "")).lower()
-            if st_status == "completed":
-                if not completed_notice_logged:
-                    log_event(
-                        "Guardian idle: last audit completed, waiting manual restart"
-                    )
-                    guardian_tg_push(
-                        "【天才猫】\n守护待机\n上次任务已完成，等待手动启动"
-                    )
-                    completed_notice_logged = True
+        try:
+            if not is_guardian_enabled():
                 gs = load_state(GUARDIAN_STATE_FILE)
+                gs["status"] = "stopped"
+                gs["last_note"] = "disabled_by_user"
                 gs["updated_at"] = now_ts()
-                gs["last_free_mb"] = mem_mb
-                gs["last_note"] = "idle_completed"
                 save_state(GUARDIAN_STATE_FILE, gs)
-                time.sleep(check_interval)
-                continue
+                break
+            mem_mb = get_available_memory_mb()
+            st = load_state(STATE_FILE)
+            if not is_alive(st.get("pid")):
+                dead_pid = st.get("pid")
+                st_status = str(st.get("status", "")).lower()
+                if st_status == "completed":
+                    if not completed_notice_logged:
+                        log_event(
+                            "Guardian idle: last audit completed, waiting manual restart"
+                        )
+                        guardian_tg_push(
+                            "【天才猫】\n守护待机\n上次任务已完成，等待手动启动"
+                        )
+                        completed_notice_logged = True
+                    gs = load_state(GUARDIAN_STATE_FILE)
+                    gs["updated_at"] = now_ts()
+                    gs["last_free_mb"] = mem_mb
+                    gs["last_note"] = "idle_completed"
+                    save_state(GUARDIAN_STATE_FILE, gs)
+                    time.sleep(check_interval)
+                    continue
 
-            if st_status in ("manual_stopped", "stopped_manual"):
-                if not manual_stop_notice_logged:
+                if st_status in ("manual_stopped", "stopped_manual"):
+                    if not manual_stop_notice_logged:
+                        log_event(
+                            "Guardian idle: audit stopped manually, waiting manual restart"
+                        )
+                        guardian_tg_push(
+                            "【天才猫】\n守护待机\n检测到手动停止，不自动拉起；等待手动启动"
+                        )
+                        manual_stop_notice_logged = True
+                    gs = load_state(GUARDIAN_STATE_FILE)
+                    gs["updated_at"] = now_ts()
+                    gs["last_free_mb"] = mem_mb
+                    gs["last_note"] = "idle_manual_stop"
+                    save_state(GUARDIAN_STATE_FILE, gs)
+                    time.sleep(check_interval)
+                    continue
+
+                if dead_pid != pending_dead_pid:
+                    pending_dead_pid = dead_pid
+                    pending_dead_since = now_ts()
+                    if dead_pid and dead_pid != notified_dead_pid:
+                        guardian_tg_push(
+                            f"【天才猫】\n审计进程异常退出\nPID: {dead_pid}\n状态: {st_status or '-'}\n将在 60 秒后尝试重启"
+                        )
+                        notified_dead_pid = dead_pid
+
+                if mem_mb is None or mem_mb >= min_free_mb:
+                    now = now_ts()
+                    if (
+                        pending_dead_since > 0
+                        and now - pending_dead_since >= crash_restart_delay
+                        and now - last_restart_ts >= min_restart_gap
+                    ):
+                        subprocess.Popen(
+                            [
+                                sys.executable,
+                                __file__,
+                                "run",
+                                str(mode),
+                                str(work_mode),
+                                str(threads),
+                                ports_str,
+                                str(feed_int),
+                            ],
+                            start_new_session=True,
+                        )
+                        last_restart_ts = now
+                        guardian_tg_push(
+                            f"【天才猫】\n守护已重启审计进程\n模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n线程: {threads}"
+                        )
+                        completed_notice_logged = False
+                        manual_stop_notice_logged = False
+                        pending_dead_pid = None
+                        pending_dead_since = 0.0
+                else:
                     log_event(
-                        "Guardian idle: audit stopped manually, waiting manual restart"
+                        f"Guardian wait: low memory {mem_mb:.0f}MB < {min_free_mb:.0f}MB"
                     )
-                    guardian_tg_push(
-                        "【天才猫】\n守护待机\n检测到手动停止，不自动拉起；等待手动启动"
-                    )
-                    manual_stop_notice_logged = True
-                gs = load_state(GUARDIAN_STATE_FILE)
-                gs["updated_at"] = now_ts()
-                gs["last_free_mb"] = mem_mb
-                gs["last_note"] = "idle_manual_stop"
-                save_state(GUARDIAN_STATE_FILE, gs)
-                time.sleep(check_interval)
-                continue
-
-            if dead_pid != pending_dead_pid:
-                pending_dead_pid = dead_pid
-                pending_dead_since = now_ts()
-                if dead_pid and dead_pid != notified_dead_pid:
-                    guardian_tg_push(
-                        f"【天才猫】\n审计进程异常退出\nPID: {dead_pid}\n状态: {st_status or '-'}\n将在 60 秒后尝试重启"
-                    )
-                    notified_dead_pid = dead_pid
-
-            if mem_mb is None or mem_mb >= min_free_mb:
-                now = now_ts()
-                if (
-                    pending_dead_since > 0
-                    and now - pending_dead_since >= crash_restart_delay
-                    and now - last_restart_ts >= min_restart_gap
-                ):
-                    subprocess.Popen(
-                        [
-                            sys.executable,
-                            __file__,
-                            "run",
-                            str(mode),
-                            str(work_mode),
-                            str(threads),
-                            ports_str,
-                            str(feed_int),
-                        ],
-                        start_new_session=True,
-                    )
-                    last_restart_ts = now
-                    guardian_tg_push(
-                        f"【天才猫】\n守护已重启审计进程\n模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n线程: {threads}"
-                    )
-                    completed_notice_logged = False
-                    manual_stop_notice_logged = False
-                    pending_dead_pid = None
-                    pending_dead_since = 0.0
             else:
-                log_event(
-                    f"Guardian wait: low memory {mem_mb:.0f}MB < {min_free_mb:.0f}MB"
-                )
-        else:
-            completed_notice_logged = False
-            manual_stop_notice_logged = False
-            notified_dead_pid = None
-            pending_dead_pid = None
-            pending_dead_since = 0.0
-        gs = load_state(GUARDIAN_STATE_FILE)
-        gs["updated_at"] = now_ts()
-        gs["last_free_mb"] = mem_mb
-        save_state(GUARDIAN_STATE_FILE, gs)
-        time.sleep(check_interval)
+                completed_notice_logged = False
+                manual_stop_notice_logged = False
+                notified_dead_pid = None
+                pending_dead_pid = None
+                pending_dead_since = 0.0
+            gs = load_state(GUARDIAN_STATE_FILE)
+            gs["updated_at"] = now_ts()
+            gs["last_free_mb"] = mem_mb
+            save_state(GUARDIAN_STATE_FILE, gs)
+            time.sleep(check_interval)
+        except Exception:
+            log_exception("guardian loop crash")
+            time.sleep(max(1.0, float(check_interval)))
 
 
 # ==================== 审计核心 (逻辑不变，输出格式显密) ====================
@@ -2815,7 +2878,7 @@ def main_console():
         print(f" 7) 断点续连             8) 停止守护             9) 退出系统")
         print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
         print(f"13) 分类清理结果        14) 疑似无L7列表        15) 一键清理")
-        print(f"16) 更换IP列表          17) 更新Tokens")
+        print(f"16) 更换IP列表          17) 更新Tokens          18) 守护诊断")
 
         try:
             c = timed_input(
@@ -3335,6 +3398,29 @@ def main_console():
                         print(f"{C_SUCC}>>> {detail}{C_W}")
                     else:
                         print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
+            time.sleep(1.2)
+
+        elif c == "18":
+            rows = list_guardian_processes_detail()
+            gstate = load_state(GUARDIAN_STATE_FILE)
+            gpid = int(gstate.get("pid", 0) or 0) if isinstance(gstate, dict) else 0
+            glock = _read_lock_pid(GUARDIAN_LOCK_FILE)
+            print(f"\n{C_CYAN}>>> 守护诊断{C_W}")
+            print(
+                f"守护开关: {C_CYAN}{'ON' if is_guardian_enabled() else 'OFF'}{C_W} | state.pid: {C_CYAN}{gpid}{C_W} | lock.pid: {C_CYAN}{glock}{C_W}"
+            )
+            print(f"匹配到 guardian 相关进程: {C_CYAN}{len(rows)}{C_W}")
+            if rows:
+                for pid, name, cmd in rows:
+                    one = cmd if len(cmd) <= 120 else (cmd[:120] + "...")
+                    print(f"- PID {pid} | {name} | {one}")
+            else:
+                print(f"{C_DIM}未发现 guardian 相关进程{C_W}")
+
+            act = input("执行强制清理 guardian 残留? (y/n): ").strip().lower()
+            if act == "y":
+                stopped = disable_and_stop_guardian_processes()
+                print(f"{C_SUCC if stopped else C_DIM}>>> 已执行清理{C_W}")
             time.sleep(1.2)
 
 
