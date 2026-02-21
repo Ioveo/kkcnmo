@@ -42,6 +42,7 @@ VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
 RUN_LOCK_FILE = os.path.join(BASE_DIR, "audit_runner.lock")
 GUARDIAN_LOCK_FILE = os.path.join(BASE_DIR, "guardian_runner.lock")
 GUARDIAN_CTRL_FILE = os.path.join(BASE_DIR, "guardian_control.json")
+MANUAL_LAUNCH_FILE = os.path.join(BASE_DIR, "manual_launch_token.json")
 MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_VERIFIED_EVENTS_BYTES = 4 * 1024 * 1024
@@ -521,6 +522,7 @@ def cleanup_runtime_files():
         GUARDIAN_STATE_FILE,
         GUARDIAN_LOCK_FILE,
         GUARDIAN_CTRL_FILE,
+        MANUAL_LAUNCH_FILE,
         TELEGRAM_CFG_FILE,
         RESUME_CFG_FILE,
         FEED_CFG_FILE,
@@ -642,6 +644,7 @@ def reload_running_audit():
     while is_alive(pid) and time.time() < deadline:
         time.sleep(0.1)
 
+    mark_manual_launch_window(20)
     subprocess.Popen(
         [
             sys.executable,
@@ -777,6 +780,28 @@ def set_guardian_enabled(enabled):
 
 def is_guardian_enabled():
     return bool(load_guardian_control().get("enabled", False))
+
+
+def mark_manual_launch_window(seconds=20):
+    try:
+        sec = max(1.0, float(seconds))
+    except (TypeError, ValueError):
+        sec = 20.0
+    save_state(MANUAL_LAUNCH_FILE, {"expires_at": now_ts() + sec})
+
+
+def consume_manual_launch_window():
+    data = load_state(MANUAL_LAUNCH_FILE)
+    try:
+        exp = float(data.get("expires_at", 0))
+    except (TypeError, ValueError):
+        exp = 0.0
+    try:
+        if os.path.exists(MANUAL_LAUNCH_FILE):
+            os.remove(MANUAL_LAUNCH_FILE)
+    except OSError:
+        pass
+    return exp > now_ts()
 
 
 def load_resume_config():
@@ -2837,6 +2862,7 @@ def main_console():
             fi = prompt_float(
                 "喂IP间隔秒 (默认0.02, 0=最快): ", default=0.02, min_value=0.0
             )
+            mark_manual_launch_window(20)
             subprocess.Popen(
                 [
                     sys.executable,
@@ -3314,6 +3340,15 @@ if __name__ == "__main__":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 7:
             raise SystemExit("参数不足")
+        prev_state = load_state(STATE_FILE)
+        prev_status = str(prev_state.get("status", "")).lower()
+        manual_launch_ok = consume_manual_launch_window()
+        if (
+            (not is_guardian_enabled())
+            and prev_status in ("manual_stopped", "stopped_manual")
+            and (not manual_launch_ok)
+        ):
+            raise SystemExit("守护已关闭，且上次为手动停止；忽略自动拉起")
         got_lock, holder_pid = acquire_run_lock()
         if not got_lock:
             if holder_pid > 0:
