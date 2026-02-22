@@ -758,6 +758,39 @@ def compact_process_memory():
     }
 
 
+def init_account_environment(keep_profile=True, keep_ports=True):
+    stopped, removed, mem_info = one_key_cleanup()
+    removed_profile = 0
+
+    if not keep_profile:
+        profile_files = [
+            NODE_FILE,
+            FALLBACK_NODE_FILE,
+            FALLBACK_NODE_FILE_UPPER,
+            TOKEN_FILE,
+            FALLBACK_TOKEN_FILE,
+            TELEGRAM_CFG_FILE,
+            RESUME_CFG_FILE,
+            FEED_CFG_FILE,
+        ]
+        for p in profile_files:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                    removed_profile += 1
+            except OSError:
+                pass
+
+    # 当前工具不维护系统级端口占用表；keep_ports=True 表示不做任何端口释放动作。
+    return {
+        "stopped": stopped,
+        "removed_runtime": removed,
+        "removed_profile": removed_profile,
+        "keep_ports": bool(keep_ports),
+        "mem_info": mem_info,
+    }
+
+
 def disable_and_stop_guardian_processes():
     set_guardian_enabled(False)
     stopped_any = False
@@ -3568,6 +3601,7 @@ def main_console():
                     (16, "分类清理"),
                     (17, "无L7列表"),
                     (18, "一键清理"),
+                    (19, "初始化"),
                 ],
             ),
             ("系统", [(0, "退出")]),
@@ -4138,6 +4172,44 @@ def main_console():
                 )
                 print(
                     f"{C_DIM}说明: 该操作回收本进程内存，系统文件缓存不一定立刻下降。{C_W}"
+                )
+            else:
+                print(f"{C_DIM}已取消{C_W}")
+            time.sleep(1.2)
+
+        elif c == "19":
+            print(f"\n{C_WARN}>>> 初始化环境（对齐 hk.txt 的初始化思路）{C_W}")
+            print(
+                f"{C_DIM}会停止审计/守护并清理运行痕迹；默认保留 IP/Tokens 配置。{C_W}"
+            )
+            keep_profile_in = (
+                input("是否保留用户配置(IP/Tokens/通知配置)? (y/n, 默认y): ")
+                .strip()
+                .lower()
+            )
+            keep_profile = keep_profile_in != "n"
+            keep_ports_in = input("是否保留端口配置? (y/n, 默认y): ").strip().lower()
+            keep_ports = keep_ports_in != "n"
+            sure = input("确认执行初始化? (y/n): ").strip().lower()
+            if sure == "y":
+                rst = init_account_environment(
+                    keep_profile=keep_profile,
+                    keep_ports=keep_ports,
+                )
+                mem_info = rst.get("mem_info", {}) if isinstance(rst, dict) else {}
+                freed_mb = (
+                    mem_info.get("freed_mb") if isinstance(mem_info, dict) else None
+                )
+                mem_msg = (
+                    f"可用内存变化 {freed_mb:+.1f}MB"
+                    if isinstance(freed_mb, (int, float))
+                    else "可用内存变化 -"
+                )
+                print(
+                    f"{C_SUCC}>>> 初始化完成: 停止进程 {rst.get('stopped', 0)} 个, "
+                    f"清理运行文件 {rst.get('removed_runtime', 0)} 个, "
+                    f"清理配置 {rst.get('removed_profile', 0)} 个, {mem_msg}, "
+                    f"保留端口:{'ON' if keep_ports else 'OFF'}{C_W}"
                 )
             else:
                 print(f"{C_DIM}已取消{C_W}")
