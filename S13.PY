@@ -3708,7 +3708,12 @@ def main_console():
                             if m == 2
                             else DEFAULT_MIXED_PORTS_HIGH
                         )
-                ps = input(f"端口 (默认 {default_ports[:20]}...): ") or default_ports
+                preset_ports = parse_ports(default_ports)
+                preview = ",".join(str(x) for x in preset_ports[:12])
+                print(
+                    f"{C_DIM}默认预设共 {len(preset_ports)} 个端口，预览: {preview}{'...' if len(preset_ports) > 12 else ''}{C_W}"
+                )
+                ps = input("端口 (回车使用默认预设): ").strip() or default_ports
                 if not parse_ports(ps):
                     print("端口无效")
                     time.sleep(1)
@@ -3903,7 +3908,12 @@ def main_console():
                     )
                 elif psel == "3":
                     default_ports = DEFAULT_FOFA_TOP100_PORTS
-            ps = input(f"端口 (默认 {default_ports[:20]}...): ") or default_ports
+            preset_ports = parse_ports(default_ports)
+            preview = ",".join(str(x) for x in preset_ports[:12])
+            print(
+                f"{C_DIM}默认预设共 {len(preset_ports)} 个端口，预览: {preview}{'...' if len(preset_ports) > 12 else ''}{C_W}"
+            )
+            ps = input("端口 (回车使用默认预设): ").strip() or default_ports
             if not parse_ports(ps):
                 print("端口无效")
                 time.sleep(1)
