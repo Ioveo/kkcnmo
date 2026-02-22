@@ -38,6 +38,7 @@ GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
 FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
+PROJECT_NOTE_FILE = os.path.join(BASE_DIR, "project_note.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
 RUN_LOCK_FILE = os.path.join(BASE_DIR, "audit_runner.lock")
@@ -1110,6 +1111,19 @@ def load_feed_turbo_config():
 
 def save_feed_turbo_config(cfg):
     save_state(FEED_CFG_FILE, cfg)
+
+
+def load_project_note():
+    data = load_state(PROJECT_NOTE_FILE)
+    if not isinstance(data, dict):
+        return ""
+    note = str(data.get("note", "") or "").strip()
+    return note[:120]
+
+
+def save_project_note(note):
+    txt = str(note or "").strip()[:120]
+    save_state(PROJECT_NOTE_FILE, {"note": txt, "updated_at": now_ts()})
 
 
 def clear_checkpoint():
@@ -3370,7 +3384,7 @@ def main_console():
     spin_idx = 0
     panel_inner = 74
     panel_border = C_BLUE
-    panel_rows = 9
+    panel_rows = 10
 
     def visible_width(text):
         clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -3525,6 +3539,7 @@ def main_console():
             else f"{C_DIM}OFF{C_W}"
         )
         mode_text = mode_label(s.get("mode", 3))
+        project_note = load_project_note()
         queue_size = int(s.get("queue_size", 0))
         tokens_loaded = int(s.get("tokens_loaded", 0))
         verify_checked = int(s.get("verify_checked", 0))
@@ -3554,6 +3569,7 @@ def main_console():
 
         right_lines = [
             f"{C_W}状态:{C_CYAN}{run_status}{C_W} {panel_border}| {C_W}模式:{C_CYAN}{mode_text}{C_W} {panel_border}| {C_W}运行:{C_CYAN}{uptime}{C_W}",
+            f"{C_BOLD}{C_WARN}项目备注:{C_W} {C_BOLD}{C_TEXT}{(project_note or '未设置')[:46]}{C_W}",
             f"{C_W}PID:{C_CYAN}{int(s.get('pid', 0) or 0)}{C_W} {panel_border}| {C_W}队列深度:{C_CYAN}{queue_size}{C_W} {panel_border}| {C_W}喂入间隔:{C_CYAN}{feed_interval:.3f}s{C_W}",
             f"{C_W}扫描目标 IP:{C_CYAN}{current_ip}{C_W}",
             f"{C_W}扫描服务:{C_CYAN}{current_service}{C_W} {panel_border}| {C_W}当前端口:{C_CYAN}{current_port}{C_W}",
@@ -3602,6 +3618,7 @@ def main_console():
                     (17, "无L7列表"),
                     (18, "一键清理"),
                     (19, "初始化"),
+                    (20, "项目备注"),
                 ],
             ),
             ("系统", [(0, "退出")]),
@@ -4213,6 +4230,24 @@ def main_console():
                 )
             else:
                 print(f"{C_DIM}已取消{C_W}")
+            time.sleep(1.2)
+
+        elif c == "20":
+            old_note = load_project_note()
+            print(f"\n{C_CYAN}>>> 项目备注{C_W}")
+            print(f"当前备注: {C_BOLD}{C_TEXT}{old_note or '未设置'}{C_W}")
+            print(
+                f"{C_DIM}输入新备注并回车保存；输入 clear 清空；直接回车保持不变。{C_W}"
+            )
+            new_note = input("新备注: ").strip()
+            if not new_note:
+                print(f"{C_DIM}备注未修改{C_W}")
+            elif new_note.lower() == "clear":
+                save_project_note("")
+                print(f"{C_SUCC}>>> 已清空项目备注{C_W}")
+            else:
+                save_project_note(new_note)
+                print(f"{C_SUCC}>>> 备注已更新{C_W}")
             time.sleep(1.2)
 
         elif c == "13":
