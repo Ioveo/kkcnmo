@@ -101,6 +101,8 @@ C_CYAN = "\033[38;5;51m"  # 标题青
 C_PROC = "\033[38;5;48m"  # 进度绿
 C_WARN = "\033[38;5;214m"  # 警告橙
 C_SUCC = "\033[38;5;46m"  # 成功绿
+C_TEXT = "\033[97m"  # 菜单白字
+C_HOT = "\033[38;5;210m"  # 菜单激活(浅红)
 C_DIM = "\033[2m"  # 暗色
 
 # ==================== 工具函数 ====================
@@ -3088,10 +3090,12 @@ def main_console():
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    def menu_cell(key, label):
-        return f"{int(key):>2}. {label}"
+    def menu_cell(key, label, hot_keys=None):
+        hot = int(key) in (hot_keys or set())
+        color = C_HOT if hot else C_TEXT
+        return f"{color}{int(key):>2}. {label}{C_W}"
 
-    def render_menu_table(sections, cols=3, col_w=24):
+    def render_menu_table(sections, hot_keys=None, cols=3, col_w=24):
         inner = cols * col_w + (cols - 1) * 2
         top = f"{panel_border}┏{'━' * inner}┓{C_W}"
         mid = f"{panel_border}┣{'━' * inner}┫{C_W}"
@@ -3107,7 +3111,7 @@ def main_console():
 
             for i in range(0, len(items), cols):
                 row_items = items[i : i + cols]
-                cells = [menu_cell(k, name) for k, name in row_items]
+                cells = [menu_cell(k, name, hot_keys=hot_keys) for k, name in row_items]
                 while len(cells) < cols:
                     cells.append("")
                 row_txt = "  ".join(
@@ -3259,8 +3263,17 @@ def main_console():
             ),
             ("系统", [(0, "退出")]),
         ]
+
+        hot_keys = set()
+        if is_alive(s.get("pid")):
+            hot_keys.add(1)
+        if is_alive(g.get("pid")):
+            hot_keys.add(7)
+        if tg_cfg.get("enabled") and tg_cfg.get("bot_token") and tg_cfg.get("chat_id"):
+            hot_keys.add(12)
+
         print()
-        render_menu_table(menu_sections, cols=3, col_w=24)
+        render_menu_table(menu_sections, hot_keys=hot_keys, cols=3, col_w=24)
 
         try:
             c = timed_input(
