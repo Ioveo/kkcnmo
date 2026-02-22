@@ -655,7 +655,12 @@ def reload_running_audit():
         return False, "当前任务参数不完整，无法重载"
 
     ports = parse_ports(ports_raw)
-    if mode not in (1, 2, 3) or work_mode not in (1, 2, 3) or threads < 1 or not ports:
+    if (
+        mode not in (1, 2, 3, 4)
+        or work_mode not in (1, 2, 3)
+        or threads < 1
+        or not ports
+    ):
         return False, "当前任务参数无效，无法重载"
 
     if not stop_process(pid):
@@ -725,7 +730,9 @@ def latest_ip_port(lines):
 
 
 def mode_label(mode):
-    return {1: "XUI专项", 2: "S5专项", 3: "深度全能"}.get(mode, str(mode))
+    return {1: "XUI专项", 2: "S5专项", 3: "深度全能", 4: "验真模式"}.get(
+        mode, str(mode)
+    )
 
 
 def work_mode_label(work_mode):
@@ -1270,6 +1277,25 @@ def parse_ports(raw):
     except ValueError:
         return []
     return sorted(set(ports))
+
+
+def split_target_ip_port(raw_target):
+    txt = str(raw_target or "").strip()
+    m = re.fullmatch(r"((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})", txt)
+    if not m:
+        return None, None
+    ip = m.group(1)
+    try:
+        port = int(m.group(2))
+    except ValueError:
+        return None, None
+    if not (1 <= port <= 65535):
+        return None, None
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None, None
+    return ip, port
 
 
 def iter_expanded_targets(raw_target):
@@ -2568,9 +2594,12 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     elif mode == 1:
         xui_ports = list(ports)
         s5_ports = []
-    else:
+    elif mode == 2:
         xui_ports = []
         s5_ports = list(ports)
+    else:
+        xui_ports = []
+        s5_ports = []
 
     state["xui_ports_total"] = len(xui_ports)
     state["s5_ports_total"] = len(s5_ports)
@@ -2787,14 +2816,15 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     async def worker():
         nonlocal special_or_sent, last_quick_persist_ts
         while True:
-            ip = await q.get()
-            if ip is None:
+            item = await q.get()
+            if item is None:
                 q.task_done()
                 break
+            ip, forced_port, target_id = item
             active_started = False
             try:
                 async with state_lock:
-                    state["current"] = f"Auditing -> {ip}"
+                    state["current"] = f"Auditing -> {target_id}"
                     state["current_ip"] = ip
                     state["active_workers"] = state.get("active_workers", 0) + 1
                     active_started = True
@@ -2870,12 +2900,55 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         if s_r:
                             await handle_found_results([s_r])
                             break
+
+                if mode == 4:
+                    verify_ports = [forced_port] if forced_port else list(ports)
+                    verified_hit = False
+                    for p in verify_ports:
+                        async with state_lock:
+                            state["current_service"] = "XUI-VERIFY"
+                            state["current_port"] = str(p)
+                        x_r = await audit_xui(
+                            ip,
+                            p,
+                            tokens,
+                            state,
+                            state_lock,
+                            3,
+                            conn_limiter,
+                            token_sem,
+                        )
+                        if x_r and is_verified_output_line(x_r):
+                            await handle_found_results([x_r])
+                            verified_hit = True
+                            break
+
+                        async with state_lock:
+                            state["current_service"] = "S5-VERIFY"
+                            state["current_port"] = str(p)
+                        s_r = await audit_socks5(
+                            ip,
+                            p,
+                            tokens,
+                            state,
+                            state_lock,
+                            3,
+                            conn_limiter,
+                            token_sem,
+                        )
+                        if s_r and is_verified_output_line(s_r):
+                            await handle_found_results([s_r])
+                            verified_hit = True
+                            break
+                    if not verified_hit:
+                        async with state_lock:
+                            state["current"] = f"Verify miss -> {target_id}"
                 quick_state_snapshot = None
                 async with state_lock:
                     state["done"] += 1
-                    state["current"] = f"Completed -> {ip}"
+                    state["current"] = f"Completed -> {target_id}"
                     if resume_enabled:
-                        done_targets.add(ip)
+                        done_targets.add(target_id)
                     now = now_ts()
                     if now - last_quick_persist_ts >= 1.0:
                         last_quick_persist_ts = now
@@ -2911,9 +2984,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         build_interval_message(special_snapshot, special_recent)
                     )
             except Exception:
-                log_exception(f"worker crash ip={ip}")
+                log_exception(f"worker crash target={target_id}")
                 async with state_lock:
-                    state["current"] = f"Worker error -> {ip}"
+                    state["current"] = f"Worker error -> {target_id}"
             finally:
                 if active_started:
                     async with state_lock:
@@ -2960,22 +3033,38 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     if not line or line.startswith("#"):
                         continue
                     for raw_target in line.split():
-                        for target in iter_expanded_targets(raw_target):
-                            if target in seen_targets:
+                        target_items = []
+                        if mode == 4:
+                            ip0, p0 = split_target_ip_port(raw_target)
+                            if ip0 and p0:
+                                target_items.append((ip0, p0, f"{ip0}:{p0}"))
+                            else:
+                                for target in iter_expanded_targets(raw_target):
+                                    target_items.append((target, None, target))
+                        else:
+                            for target in iter_expanded_targets(raw_target):
+                                target_items.append((target, None, target))
+
+                        for target, forced_port, target_id in target_items:
+                            if target_id in seen_targets:
                                 continue
-                            seen_targets.add(target)
+                            seen_targets.add(target_id)
                             async with state_lock:
                                 state["total"] += 1
-                                state["current"] = f"Parsing target -> {target}"
+                                state["current"] = f"Parsing target -> {target_id}"
 
-                            if resume_enabled and target in done_targets:
+                            if resume_enabled and target_id in done_targets:
                                 skipped_by_resume += 1
                                 async with state_lock:
                                     state["done"] += 1
                                     state["skipped_resume"] += 1
                                 continue
 
-                            if skip_scanned_enabled and target in scanned_ips:
+                            if (
+                                skip_scanned_enabled
+                                and forced_port is None
+                                and target in scanned_ips
+                            ):
                                 skipped_by_history += 1
                                 async with state_lock:
                                     state["done"] += 1
@@ -2985,9 +3074,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             async with state_lock:
                                 state["feed_total"] += 1
                                 state["fed"] += 1
-                                state["current"] = f"Feeding target -> {target}"
+                                state["current"] = f"Feeding target -> {target_id}"
 
-                            await q.put(target)
+                            await q.put((target, forced_port, target_id))
                             if feed_int > 0:
                                 await asyncio.sleep(feed_int)
     except OSError:
@@ -3304,14 +3393,24 @@ def main_console():
                 continue
             print(f"\n{C_CYAN}>>> 配置审计参数{C_W}")
             m = prompt_int(
-                "模式 (1.XUI / 2.S5 / 3.全能): ", default=3, min_value=1, max_value=3
-            )
-            wm = prompt_int(
-                "深度 (1.探索 / 2.探索+验真 / 3.直跑验真): ",
-                default=2,
+                "模式 (1.XUI / 2.S5 / 3.全能 / 4.验真): ",
+                default=3,
                 min_value=1,
-                max_value=3,
+                max_value=4,
             )
+            if m == 4:
+                wm = 3
+                print(
+                    f"{C_DIM}验真模式: 直接使用 nodes.list/ip.txt 目标 + tokens.list 逐条验真{C_W}"
+                )
+                print(f"{C_DIM}建议目标格式: IP:PORT（如 1.2.3.4:2053）{C_W}")
+            else:
+                wm = prompt_int(
+                    "深度 (1.探索 / 2.探索+验真 / 3.直跑验真): ",
+                    default=2,
+                    min_value=1,
+                    max_value=3,
+                )
             th = prompt_int(
                 "线程 (默认 1000): ", default=1000, min_value=1, max_value=1000
             )
@@ -3876,7 +3975,7 @@ if __name__ == "__main__":
         mode, work_mode, threads = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
         ports, feed_int = parse_ports(sys.argv[5]), float(sys.argv[6])
         if (
-            mode not in (1, 2, 3)
+            mode not in (1, 2, 3, 4)
             or work_mode not in (1, 2, 3)
             or threads < 1
             or not ports
