@@ -3088,6 +3088,39 @@ def main_console():
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
+    def menu_cell(key, label):
+        return f"{int(key):>2}. {label}"
+
+    def render_menu_table(sections, cols=3, col_w=24):
+        inner = cols * col_w + (cols - 1) * 2
+        top = f"{panel_border}┏{'━' * inner}┓{C_W}"
+        mid = f"{panel_border}┣{'━' * inner}┫{C_W}"
+        bottom = f"{panel_border}┗{'━' * inner}┛{C_W}"
+
+        print(top)
+        for sec_idx, (title, items) in enumerate(sections):
+            title_txt = f" {title} "
+            title_pad = max(0, inner - visible_width(title_txt))
+            print(
+                f"{panel_border}┃{C_CYAN}{title_txt}{panel_border}{'─' * title_pad}┃{C_W}"
+            )
+
+            for i in range(0, len(items), cols):
+                row_items = items[i : i + cols]
+                cells = [menu_cell(k, name) for k, name in row_items]
+                while len(cells) < cols:
+                    cells.append("")
+                row_txt = "  ".join(
+                    cell + " " * max(0, col_w - visible_width(cell)) for cell in cells
+                )
+                row_txt = row_txt[:inner]
+                row_pad = max(0, inner - visible_width(row_txt))
+                print(f"{panel_border}┃{row_txt}{' ' * row_pad}{panel_border}┃{C_W}")
+
+            if sec_idx != len(sections) - 1:
+                print(mid)
+        print(bottom)
+
     # 仅在守护开关本来就是关闭时清理残留，避免误杀用户刚启动的守护进程
     if not is_guardian_enabled():
         disable_and_stop_guardian_processes()
@@ -3196,22 +3229,38 @@ def main_console():
             right_lines,
         )
 
-        print(f"\n{C_CYAN}[ 运行 ]{C_W}")
-        print(f" 1) 启动审计             2) 停止审计             3) 实时监控")
-        print(f" 4) XUI 面板             5) S5 面板              6) 小鸡资源")
-
-        print(f"{C_CYAN}[ 守护 ]{C_W}")
-        print(f" 7) 启动守护             8) 停止守护             9) 守护诊断")
-
-        print(f"{C_CYAN}[ 配置与通知 ]{C_W}")
-        print(f"10) 断点续连            11) 进料加速            12) Telegram")
-
-        print(f"{C_CYAN}[ 数据操作 ]{C_W}")
-        print(f"13) 更换IP              14) 更新口令            15) 系统日志")
-        print(f"16) 分类清理            17) 无L7列表            18) 一键清理")
-
-        print(f"{C_CYAN}[ 系统 ]{C_W}")
-        print(f" 0) 退出")
+        menu_sections = [
+            (
+                "运行",
+                [
+                    (1, "启动审计"),
+                    (2, "停止审计"),
+                    (3, "实时监控"),
+                    (4, "XUI面板"),
+                    (5, "S5面板"),
+                    (6, "小鸡资源"),
+                ],
+            ),
+            ("守护", [(7, "启动守护"), (8, "停止守护"), (9, "守护诊断")]),
+            (
+                "配置与通知",
+                [(10, "断点续连"), (11, "进料加速"), (12, "Telegram")],
+            ),
+            (
+                "数据操作",
+                [
+                    (13, "更换IP"),
+                    (14, "更新口令"),
+                    (15, "系统日志"),
+                    (16, "分类清理"),
+                    (17, "无L7列表"),
+                    (18, "一键清理"),
+                ],
+            ),
+            ("系统", [(0, "退出")]),
+        ]
+        print()
+        render_menu_table(menu_sections, cols=3, col_w=24)
 
         try:
             c = timed_input(
