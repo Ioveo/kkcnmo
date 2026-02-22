@@ -3117,7 +3117,6 @@ def main_console():
                 row_txt = "  ".join(
                     cell + " " * max(0, col_w - visible_width(cell)) for cell in cells
                 )
-                row_txt = row_txt[:inner]
                 row_pad = max(0, inner - visible_width(row_txt))
                 print(f"{panel_border}┃{row_txt}{' ' * row_pad}{panel_border}┃{C_W}")
 
