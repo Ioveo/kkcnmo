@@ -1679,6 +1679,245 @@ def get_cpu_usage_percent():
         return None
 
 
+def _read_text_quiet(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _parse_positive_number(raw):
+    txt = str(raw or "").strip().lower()
+    if not txt or txt == "max":
+        return None
+    try:
+        val = float(txt)
+    except ValueError:
+        return None
+    if val <= 0:
+        return None
+    return val
+
+
+def _read_first_number(paths):
+    for p in paths:
+        txt = _read_text_quiet(p)
+        val = _parse_positive_number(txt)
+        if val is not None:
+            return val
+    return None
+
+
+def _read_cpu_usage_usec_cgroup():
+    stat_txt = _read_text_quiet("/sys/fs/cgroup/cpu.stat")
+    if stat_txt:
+        for line in stat_txt.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "usage_usec":
+                try:
+                    return float(parts[1])
+                except ValueError:
+                    break
+
+    ns_txt = _read_text_quiet("/sys/fs/cgroup/cpuacct/cpuacct.usage")
+    if ns_txt:
+        try:
+            return float(ns_txt) / 1000.0
+        except ValueError:
+            return None
+    return None
+
+
+def _read_cpu_quota_cores():
+    cpu_max = _read_text_quiet("/sys/fs/cgroup/cpu.max")
+    if cpu_max:
+        parts = cpu_max.split()
+        if len(parts) >= 2 and parts[0] != "max":
+            try:
+                quota = float(parts[0])
+                period = float(parts[1])
+                if quota > 0 and period > 0:
+                    return quota / period
+            except ValueError:
+                pass
+
+    quota = _read_first_number(["/sys/fs/cgroup/cpu/cpu.cfs_quota_us"])
+    period = _read_first_number(["/sys/fs/cgroup/cpu/cpu.cfs_period_us"])
+    if quota is not None and period is not None and period > 0:
+        return quota / period
+    return None
+
+
+def _short_size(num_bytes):
+    if not isinstance(num_bytes, (int, float)) or num_bytes < 0:
+        return "-"
+    units = [(1024**3, "G"), (1024**2, "M"), (1024, "K")]
+    for base, suffix in units:
+        if num_bytes >= base:
+            return f"{num_bytes / base:.1f}{suffix}"
+    return f"{num_bytes:.0f}B"
+
+
+def _tiny_bar(percent, width=28):
+    p = max(0.0, min(100.0, float(percent or 0.0)))
+    fill = int(round((p / 100.0) * width))
+    fill = max(0, min(width, fill))
+    return f"[{C_PROC}{'=' * fill}{C_DIM}{'-' * (width - fill)}{C_W}]"
+
+
+def collect_vps_limit_snapshot(sample_sec=0.35):
+    sample_sec = max(0.2, min(1.2, float(sample_sec)))
+
+    disk_used = disk_total = None
+    try:
+        du = shutil.disk_usage("/")
+        disk_total = float(du.total)
+        disk_used = float(du.used)
+    except OSError:
+        pass
+
+    pids_current = _read_first_number(
+        ["/sys/fs/cgroup/pids.current", "/sys/fs/cgroup/pids/pids.current"]
+    )
+    pids_limit = _read_first_number(
+        ["/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max"]
+    )
+    if pids_current is None and os.path.exists("/proc"):
+        try:
+            pids_current = float(len([x for x in os.listdir("/proc") if x.isdigit()]))
+        except OSError:
+            pass
+    if pids_limit is None:
+        pids_limit = _read_first_number(["/proc/sys/kernel/pid_max"])
+
+    mem_used = _read_first_number(
+        [
+            "/sys/fs/cgroup/memory.current",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ]
+    )
+    mem_limit = _read_first_number(
+        [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ]
+    )
+    if mem_limit is not None and mem_limit > (1 << 60):
+        mem_limit = None
+    if mem_used is None:
+        free_mb = get_available_memory_mb()
+        total_mb = get_total_memory_mb()
+        if (
+            isinstance(free_mb, (int, float))
+            and isinstance(total_mb, (int, float))
+            and total_mb > 0
+        ):
+            mem_limit = float(total_mb) * 1024.0 * 1024.0
+            mem_used = max(0.0, (float(total_mb) - float(free_mb))) * 1024.0 * 1024.0
+
+    cpu_pct = None
+    cpu_usage_a = _read_cpu_usage_usec_cgroup()
+    cpu_cores = _read_cpu_quota_cores()
+    if cpu_usage_a is not None:
+        time.sleep(sample_sec)
+        cpu_usage_b = _read_cpu_usage_usec_cgroup()
+        if cpu_usage_b is not None and cpu_usage_b >= cpu_usage_a:
+            delta_usec = cpu_usage_b - cpu_usage_a
+            if isinstance(cpu_cores, (int, float)) and cpu_cores > 0:
+                cap_usec = sample_sec * 1_000_000.0 * cpu_cores
+            else:
+                cap_usec = sample_sec * 1_000_000.0
+            if cap_usec > 0:
+                cpu_pct = max(0.0, min(100.0, (delta_usec / cap_usec) * 100.0))
+    if cpu_pct is None:
+        cpu_pct = get_cpu_usage_percent()
+        if cpu_pct is None:
+            time.sleep(0.2)
+            cpu_pct = get_cpu_usage_percent()
+    if cpu_pct is None:
+        cpu_pct = 0.0
+
+    php_versions = [
+        "5.6",
+        "7.0",
+        "7.1",
+        "7.2",
+        "7.3",
+        "7.4",
+        "8.0",
+        "8.1",
+        "8.2",
+        "8.3",
+        "8.4",
+    ]
+    php_counts = {v: 0 for v in php_versions}
+
+    return {
+        "disk_used": disk_used,
+        "disk_total": disk_total,
+        "pids_current": pids_current,
+        "pids_limit": pids_limit,
+        "mem_used": mem_used,
+        "mem_limit": mem_limit,
+        "cpu_pct": float(cpu_pct),
+        "php_counts": php_counts,
+    }
+
+
+def render_vps_limits_panel():
+    snap = collect_vps_limit_snapshot(sample_sec=0.35)
+
+    def line_block(label, used, total):
+        if (
+            isinstance(used, (int, float))
+            and isinstance(total, (int, float))
+            and total > 0
+        ):
+            pct = max(0.0, min(100.0, (float(used) / float(total)) * 100.0))
+            return f"{label:<11} {_tiny_bar(pct)} {pct:5.2f}% ({_short_size(used)}/{_short_size(total)})"
+        return f"{label:<11} {_tiny_bar(0)}  0.00% (-/-)"
+
+    disk_line = line_block(
+        "Powierzchnia:", snap.get("disk_used"), snap.get("disk_total")
+    )
+
+    p_cur = snap.get("pids_current")
+    p_max = snap.get("pids_limit")
+    if (
+        isinstance(p_cur, (int, float))
+        and isinstance(p_max, (int, float))
+        and p_max > 0
+    ):
+        p_pct = max(0.0, min(100.0, (float(p_cur) / float(p_max)) * 100.0))
+        proc_line = f"{'Procesy:':<11} {_tiny_bar(p_pct)} {p_pct:5.2f}% ({int(p_cur)}/{int(p_max)})"
+    else:
+        proc_line = f"{'Procesy:':<11} {_tiny_bar(0)}  0.00% (-/-)"
+
+    ram_line = line_block("Pamięć RAM:", snap.get("mem_used"), snap.get("mem_limit"))
+
+    cpu_pct = max(0.0, min(100.0, float(snap.get("cpu_pct", 0.0))))
+    cpu_line = f"{'CPU:':<11} {_tiny_bar(cpu_pct)} {cpu_pct:5.2f}% ({cpu_pct:.1f}/100)"
+
+    php = snap.get("php_counts", {})
+    row1 = ["5.6", "7.0", "7.1", "7.2", "7.3", "7.4"]
+    row2 = ["8.0", "8.1", "8.2", "8.3", "8.4"]
+
+    def fmt_php_row(versions):
+        cells = []
+        for v in versions:
+            cells.append(f"[{v}: {int(php.get(v, 0))}/3]")
+        return " ".join(cells)
+
+    print(f"\n{C_CYAN}=| Limity |={C_W}")
+    print(f" {disk_line}")
+    print(f" {proc_line}")
+    print(f" {ram_line}")
+    print(f" {cpu_line}")
+    print(f" {'PHP:':<11}{fmt_php_row(row1)}")
+    print(f" {'':<11}{fmt_php_row(row2)}")
+
+
 class AdaptiveLimiter:
     def __init__(self, capacity):
         self._capacity = max(1, int(capacity))
@@ -2366,6 +2605,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         return (
             f"【天才猫】\n"
             f"模式: {mode_label(mode)} / {work_mode_label(work_mode)}\n"
+            f"进度: {snapshot.get('done', 0)}/{snapshot.get('total', 0)}\n"
             f"验真成功: XUI {snapshot.get('xui_verified', 0)} | S5真穿透 {snapshot.get('s5_verified', 0)}\n"
             f"XUI:\n" + ("\n".join(xui_lines[-5:]) if xui_lines else "-") + "\n\n"
             f"S5:\n" + ("\n".join(s5_lines[-5:]) if s5_lines else "-")
@@ -2774,12 +3014,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         final_recent = [
             x for x in list(state.get("recent", [])) if is_verified_output_line(x)
         ][-5:]
-        if cond_mode == 4:
-            if (not special_or_sent) and final_recent:
-                schedule_telegram(build_interval_message(final_snapshot, final_recent))
-        else:
-            if final_recent:
-                schedule_telegram(build_interval_message(final_snapshot, final_recent))
+        schedule_telegram(build_interval_message(final_snapshot, final_recent))
     flush_stop.set()
     await asyncio.gather(flusher, adaptive_task, return_exceptions=True)
     if notify_tasks:
@@ -2853,7 +3088,9 @@ def main_console():
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    disable_and_stop_guardian_processes()
+    # 仅在守护开关本来就是关闭时清理残留，避免误杀用户刚启动的守护进程
+    if not is_guardian_enabled():
+        disable_and_stop_guardian_processes()
 
     while True:
         sys.stdout.write("\x1b[H\x1b[J")
@@ -2931,7 +3168,7 @@ def main_console():
 
         left_lines = [
             f"{C_W}审计引擎:{p_status} {panel_border}| {C_W}自启守护:{g_status} {panel_border}| {C_W}断点续连:{resume_status} {panel_border}| {C_W}Telegram:{tg_status}",
-            f"{C_W}解析:{C_CYAN}{total}{C_W}/{parse_total} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{parse_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}模式:{C_CYAN}{work_mode_text}",
+            f"{C_W}解析:{C_CYAN}{total}{C_W}/{parse_total} ({'完成' if parse_done else '进行中'}) {panel_border}| {C_W}投喂:{C_CYAN}{fed}{C_W}/{parse_total} {panel_border}| {C_W}并行:{C_CYAN}{active_workers}{C_W} {panel_border}| {C_W}工作模式:{C_CYAN}{work_mode_text}",
             f"{C_W}投喂消化:{C_CYAN}{worker_done}{C_W}/{fed} ({C_CYAN}{progress_pct:5.1f}%{C_W})",
             f"{C_W}全体进度(含跳过): {parse_bar}  跳过:{C_CYAN}{skipped_total}{C_W}",
             f"{C_W}投喂进度条      : {feed_bar}",
@@ -2962,7 +3199,8 @@ def main_console():
         print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
         print(f" 1) 启动审计             2) 监控面板             3) X-UI审计/验真")
         print(f" 4) 查看日志             5) 停止审计             6) 启动守护")
-        print(f" 7) 断点续连             8) 停止守护             0) 退出系统")
+        print(f" 7) 断点续连             8) 停止守护             9) 小鸡资源")
+        print(f" 0) 退出系统")
         print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
         print(f"13) 分类清理结果        14) 疑似无L7列表        15) 一键清理")
         print(f"16) 更换IP列表          17) 更新Tokens          18) 守护诊断")
@@ -3371,7 +3609,18 @@ def main_console():
                 print(f"{C_DIM}没有运行中的守护{C_W}")
             time.sleep(1)
 
-        elif c in ("0", "9"):
+        elif c == "9":
+            try:
+                while True:
+                    os.system("cls" if os.name == "nt" else "clear")
+                    render_vps_limits_panel()
+                    print(f"\n{C_DIM}回车返回主菜单...{C_W}")
+                    if poll_zero_to_back(0.4):
+                        break
+            except KeyboardInterrupt:
+                pass
+
+        elif c == "0":
             break
         elif c == "11":
             try:
