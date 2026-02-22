@@ -719,8 +719,43 @@ def one_key_cleanup():
     stopped += stop_guardian_processes_fallback()
 
     removed = cleanup_runtime_files()
-    gc.collect()
-    return stopped, removed
+    mem_info = compact_process_memory()
+    return stopped, removed, mem_info
+
+
+def compact_process_memory():
+    before_mb = get_available_memory_mb()
+
+    for _ in range(3):
+        gc.collect()
+
+    trimmed = False
+    if os.name == "nt":
+        try:
+            hproc = ctypes.windll.kernel32.GetCurrentProcess()
+            if hproc:
+                trimmed = bool(ctypes.windll.psapi.EmptyWorkingSet(hproc))
+        except Exception:
+            trimmed = False
+    else:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                trimmed = bool(libc.malloc_trim(0))
+        except Exception:
+            trimmed = False
+
+    after_mb = get_available_memory_mb()
+    freed_mb = None
+    if isinstance(before_mb, (int, float)) and isinstance(after_mb, (int, float)):
+        freed_mb = round(after_mb - before_mb, 1)
+
+    return {
+        "before_mb": before_mb,
+        "after_mb": after_mb,
+        "freed_mb": freed_mb,
+        "trimmed": trimmed,
+    }
 
 
 def disable_and_stop_guardian_processes():
@@ -872,6 +907,37 @@ def resolve_token_file():
     if os.path.exists(FALLBACK_TOKEN_FILE):
         return FALLBACK_TOKEN_FILE
     return None
+
+
+def load_tokens_list():
+    tokens = []
+    token_file = resolve_token_file()
+    if not token_file:
+        return tokens
+    try:
+        with open(token_file, "r", encoding="utf-8", errors="ignore") as f:
+            for l in f:
+                l = l.strip()
+                if (not l) or l.startswith("#"):
+                    continue
+                if ":" in l:
+                    u, p = l.split(":", 1)
+                    u = u.strip()
+                    p = p.strip()
+                    if (not u) and (not p):
+                        continue
+                    if not u:
+                        u = "admin"
+                    if not p:
+                        continue
+                    tokens.append([u, p])
+                else:
+                    p = l.strip()
+                    if p:
+                        tokens.append(["admin", p])
+    except OSError:
+        return []
+    return tokens
 
 
 def mask_secret(secret):
@@ -2613,6 +2679,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "s5_verified": 0,
         "verify_checked": 0,
         "verify_alive": 0,
+        "verify_invalid": 0,
+        "verify_noport": 0,
         "verifying_ip_count": 0,
         "active_workers": 0,
         "queue_size": 0,
@@ -2896,29 +2964,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     flusher = asyncio.create_task(flush_state_loop())
     adaptive_task = asyncio.create_task(adaptive_conn_loop())
 
-    tokens = []
-    token_file = resolve_token_file()
-    if token_file:
-        with open(token_file, "r", encoding="utf-8", errors="ignore") as f:
-            for l in f:
-                l = l.strip()
-                if (not l) or l.startswith("#"):
-                    continue
-                if ":" in l:
-                    u, p = l.split(":", 1)
-                    u = u.strip()
-                    p = p.strip()
-                    if (not u) and (not p):
-                        continue
-                    if not u:
-                        u = "admin"
-                    if not p:
-                        continue
-                    tokens.append([u, p])
-                else:
-                    p = l.strip()
-                    if p:
-                        tokens.append(["admin", p])
+    tokens = load_tokens_list()
     async with state_lock:
         state["tokens_loaded"] = len(tokens)
 
@@ -3043,6 +3089,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             state["verify_checked"] = state.get("verify_checked", 0) + 1
                             if alive:
                                 state["verify_alive"] = state.get("verify_alive", 0) + 1
+                                state["verify_line"] = f"PROBE_OK {ip}:{p}"
+                            else:
+                                state["verify_line"] = f"PROBE_FAIL {ip}:{p}"
 
                         if not alive:
                             continue
@@ -3182,8 +3231,21 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             if ip0 and p0:
                                 target_items.append((ip0, p0, f"{ip0}:{p0}"))
                             else:
-                                for target in iter_expanded_targets(raw_target):
-                                    target_items.append((target, None, target))
+                                is_plain_ip = False
+                                try:
+                                    ipaddress.ip_address(raw_target)
+                                    is_plain_ip = True
+                                except ValueError:
+                                    is_plain_ip = False
+                                async with state_lock:
+                                    state["verify_invalid"] = (
+                                        state.get("verify_invalid", 0) + 1
+                                    )
+                                    if is_plain_ip:
+                                        state["verify_noport"] = (
+                                            state.get("verify_noport", 0) + 1
+                                        )
+                                continue
                         else:
                             for target in iter_expanded_targets(raw_target):
                                 target_items.append((target, None, target))
@@ -3434,6 +3496,8 @@ def main_console():
         tokens_loaded = int(s.get("tokens_loaded", 0))
         verify_checked = int(s.get("verify_checked", 0))
         verify_alive = int(s.get("verify_alive", 0))
+        verify_invalid = int(s.get("verify_invalid", 0))
+        verify_noport = int(s.get("verify_noport", 0))
         current_ip = str(s.get("current_ip", "-"))
         current_service = str(s.get("current_service", "-"))
         current_port = str(s.get("current_port", "-"))
@@ -3462,7 +3526,7 @@ def main_console():
             f"{C_W}扫描服务:{C_CYAN}{current_service}{C_W} {panel_border}| {C_W}当前端口:{C_CYAN}{current_port}{C_W}",
             f"{C_W}验真读取:{C_CYAN}{str(s.get('verify_line', '-'))[:58]}{C_W}",
             (
-                f"{C_W}验真探测 存活:{C_CYAN}{verify_alive}{C_W}/{verify_checked}"
+                f"{C_W}验真探测 存活:{C_CYAN}{verify_alive}{C_W}/{verify_checked} {panel_border}| {C_W}无效:{C_WARN}{verify_invalid}{C_W} 缺端口:{C_WARN}{verify_noport}{C_W}"
                 if int(s.get("mode", 0) or 0) == 4
                 else f"{C_W}端口装载 XUI:{C_CYAN}{xui_ports_total}{C_W} {panel_border}| {C_W}S5:{C_CYAN}{s5_ports_total}{C_W}"
             ),
@@ -3564,8 +3628,16 @@ def main_console():
                 "线程 (默认 1000): ", default=1000, min_value=1, max_value=1000
             )
             if m == 4:
+                token_count = len(load_tokens_list())
+                if token_count <= 0:
+                    print(
+                        f"{C_WARN}未读取到 tokens.list/pass.txt，有效口令为 0，已取消启动{C_W}"
+                    )
+                    time.sleep(1.2)
+                    continue
                 ps = ""
                 print(f"{C_DIM}验真模式已忽略端口输入，将优先使用文件中的 IP:PORT{C_W}")
+                print(f"{C_DIM}当前口令数: {token_count}{C_W}")
             else:
                 default_ports = (
                     DEFAULT_XUI_PORTS
@@ -4047,9 +4119,25 @@ def main_console():
             if sure == "0":
                 continue
             if sure == "y":
-                stopped, removed = one_key_cleanup()
+                stopped, removed, mem_info = one_key_cleanup()
+                freed_mb = (
+                    mem_info.get("freed_mb") if isinstance(mem_info, dict) else None
+                )
+                trim_flag = (
+                    bool(mem_info.get("trimmed"))
+                    if isinstance(mem_info, dict)
+                    else False
+                )
+                mem_msg = (
+                    f"可用内存变化 {freed_mb:+.1f}MB"
+                    if isinstance(freed_mb, (int, float))
+                    else "可用内存变化 -"
+                )
                 print(
-                    f"{C_SUCC}>>> 清理完成: 停止进程 {stopped} 个, 删除文件 {removed} 个{C_W}"
+                    f"{C_SUCC}>>> 清理完成: 停止进程 {stopped} 个, 删除文件 {removed} 个, {mem_msg}, 内存回收:{'ON' if trim_flag else 'OFF'}{C_W}"
+                )
+                print(
+                    f"{C_DIM}说明: 该操作回收本进程内存，系统文件缓存不一定立刻下降。{C_W}"
                 )
             else:
                 print(f"{C_DIM}已取消{C_W}")
