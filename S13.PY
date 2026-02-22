@@ -3196,14 +3196,22 @@ def main_console():
             right_lines,
         )
 
-        print(f"\n{C_CYAN} [ 核心指令 ]{C_W}")
-        print(f" 1) 启动审计             2) 监控面板             3) X-UI审计/验真")
-        print(f" 4) 查看日志             5) 停止审计             6) 启动守护")
-        print(f" 7) 断点续连             8) 停止守护             9) 小鸡资源")
-        print(f" 0) 退出系统")
-        print(f"10) Telegram推送        11) S5审计/验真        12) 进料加速策略")
-        print(f"13) 分类清理结果        14) 疑似无L7列表        15) 一键清理")
-        print(f"16) 更换IP列表          17) 更新Tokens          18) 守护诊断")
+        print(f"\n{C_CYAN}[ 运行 ]{C_W}")
+        print(f" 1) 启动审计             2) 停止审计             3) 实时监控")
+        print(f" 4) XUI 面板             5) S5 面板              6) 小鸡资源")
+
+        print(f"{C_CYAN}[ 守护 ]{C_W}")
+        print(f" 7) 启动守护             8) 停止守护             9) 守护诊断")
+
+        print(f"{C_CYAN}[ 配置与通知 ]{C_W}")
+        print(f"10) 断点续连            11) 进料加速            12) Telegram")
+
+        print(f"{C_CYAN}[ 数据操作 ]{C_W}")
+        print(f"13) 更换IP              14) 更新口令            15) 系统日志")
+        print(f"16) 分类清理            17) 无L7列表            18) 一键清理")
+
+        print(f"{C_CYAN}[ 系统 ]{C_W}")
+        print(f" 0) 退出")
 
         try:
             c = timed_input(
@@ -3276,7 +3284,7 @@ def main_console():
             print(f"{C_SUCC}>>> 核心已启动!{C_W}")
             time.sleep(1)
 
-        elif c == "2":
+        elif c == "3":
             while True:
                 if poll_zero_to_back(0.05):
                     break
@@ -3354,7 +3362,7 @@ def main_console():
                 if poll_zero_to_back(0.35):
                     break
 
-        elif c == "3":
+        elif c == "4":
             try:
                 last_sig = None
                 while True:
@@ -3398,13 +3406,13 @@ def main_console():
             except KeyboardInterrupt:
                 pass
 
-        elif c == "4":
+        elif c == "15":
             output = read_last_lines(LOG_FILE, lines=50)
             print(f"\n{C_CYAN}>>> 系统日志{C_W}\n")
             print(output if output else f"{C_DIM}暂无日志{C_W}")
             wait_for_zero_return(f"\n{C_BLUE}回车返回...{C_W}")
 
-        elif c == "5":
+        elif c == "2":
             disable_and_stop_guardian_processes()
             pid = load_state(STATE_FILE).get("pid")
             if stop_process(pid):
@@ -3419,7 +3427,7 @@ def main_console():
                 print(f"{C_DIM}没有运行中的任务{C_W}")
             time.sleep(1)
 
-        elif c == "6":
+        elif c == "7":
             # 守护进程启动逻辑 (保持不变)
             m = prompt_int("守护模式 (3): ", default=3, min_value=1, max_value=3)
             th = prompt_int(
@@ -3462,7 +3470,7 @@ def main_console():
             print(f"{C_SUCC}>>> 守护进程已启动{C_W}")
             time.sleep(1)
 
-        elif c == "7":
+        elif c == "10":
             rcfg = load_resume_config()
             print(f"\n{C_CYAN}>>> 断点续连配置{C_W}")
             print(f"当前状态: {'启用' if rcfg.get('enabled', True) else '关闭'}")
@@ -3494,7 +3502,7 @@ def main_console():
                 print(f"{C_WARN}>>> 已关闭已扫跳过{C_W}")
             time.sleep(1)
 
-        elif c == "12":
+        elif c == "11":
             fcfg = load_feed_turbo_config()
             print(f"\n{C_CYAN}>>> 进料加速策略{C_W}")
             print("规则: 剩余比例<=触发阈值时加速, 剩余比例<=冲刺阈值时不再等待")
@@ -3538,7 +3546,7 @@ def main_console():
             print(f"{C_DIM}提示: 新策略会在下一次启动审计时生效{C_W}")
             time.sleep(1.5)
 
-        elif c == "10":
+        elif c == "12":
             cfg = load_telegram_config()
             print(f"\n{C_CYAN}>>> Telegram 推送配置{C_W}")
             print(
@@ -3609,7 +3617,7 @@ def main_console():
                 print(f"{C_DIM}没有运行中的守护{C_W}")
             time.sleep(1)
 
-        elif c == "9":
+        elif c == "6":
             try:
                 while True:
                     os.system("cls" if os.name == "nt" else "clear")
@@ -3622,7 +3630,7 @@ def main_console():
 
         elif c == "0":
             break
-        elif c == "11":
+        elif c == "5":
             try:
                 last_sig = None
                 while True:
@@ -3666,7 +3674,7 @@ def main_console():
             except KeyboardInterrupt:
                 pass
 
-        elif c == "13":
+        elif c == "16":
             print(f"\n{C_CYAN}>>> 分类清理审计结果{C_W}")
             print("1) 清理 XUI")
             print("2) 清理 S5")
@@ -3688,7 +3696,7 @@ def main_console():
             print(f"{C_SUCC}>>> 清理完成，移除 {removed} 条{C_W}")
             time.sleep(1.2)
 
-        elif c == "14":
+        elif c == "17":
             rows = collect_suspected_no_l7(limit=None)
             os.system("cls" if os.name == "nt" else "clear")
             print(f"\n{C_CYAN}>>> 疑似无L7能力列表{C_W}")
@@ -3699,7 +3707,7 @@ def main_console():
                 print(f"{C_DIM}暂无疑似无L7数据{C_W}")
             wait_for_zero_return(f"\n{C_BLUE}回车返回...{C_W}")
 
-        elif c == "15":
+        elif c == "18":
             print(f"\n{C_WARN}>>> 一键清理将停止审计/守护并删除运行文件{C_W}")
             print(
                 f"{C_DIM}仅保留 IP 文件与 tokens 文件（如 nodes.list/ip.txt/pass.txt）{C_W}"
@@ -3716,7 +3724,7 @@ def main_console():
                 print(f"{C_DIM}已取消{C_W}")
             time.sleep(1.2)
 
-        elif c == "16":
+        elif c == "13":
             print(f"\n{C_CYAN}>>> 更换 IP 列表 ({NODE_FILE}){C_W}")
             print(f"{C_DIM}支持空格/换行混合输入，保存后自动按一行一个目标整理{C_W}")
             print(f"{C_DIM}示例: 1.1.1.1 2.2.2.2/24 3.3.3.3-3.3.3.9{C_W}")
@@ -3734,7 +3742,7 @@ def main_console():
                         print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
             time.sleep(1.2)
 
-        elif c == "17":
+        elif c == "14":
             print(f"\n{C_CYAN}>>> 更新 Tokens ({TOKEN_FILE}){C_W}")
             print(
                 f"{C_DIM}支持空格/换行混合输入，格式示例: admin:admin  root:123456{C_W}"
@@ -3753,7 +3761,7 @@ def main_console():
                         print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
             time.sleep(1.2)
 
-        elif c == "18":
+        elif c == "9":
             rows = list_guardian_processes_detail()
             gstate = load_state(GUARDIAN_STATE_FILE)
             gpid = int(gstate.get("pid", 0) or 0) if isinstance(gstate, dict) else 0
