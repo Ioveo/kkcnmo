@@ -19,6 +19,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import gc
+from collections import deque
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -51,11 +52,11 @@ MAX_VERIFIED_EVENTS_BYTES = 4 * 1024 * 1024
 LOG_BACKUPS = 5
 REPORT_BACKUPS = 3
 VERIFIED_EVENTS_BACKUPS = 2
-STATE_FLUSH_INTERVAL = 1.0
-CHECKPOINT_FLUSH_INTERVAL = 3.0
+STATE_FLUSH_INTERVAL = 2.0
+CHECKPOINT_FLUSH_INTERVAL = 5.0
 CHECKPOINT_GROWTH_STEP = 500
 CHECKPOINT_MAX_IDLE_FLUSH_SEC = 30.0
-MAX_SOCKET_CONCURRENCY = 600
+MAX_SOCKET_CONCURRENCY = 500
 FEED_ACCEL_TRIGGER_RATIO = 0.5
 FEED_FINAL_RUSH_RATIO = 0.1
 FEED_ACCEL_FACTOR = 0.5
@@ -2537,21 +2538,45 @@ async def audit_socks5(
     token_sem=None,
 ):
     async def check_l7(reader, writer):
-        try:
-            req = (
-                b"GET /hotspot-detect.html HTTP/1.1\r\n"
-                b"Host: captive.apple.com\r\n"
-                b"User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15\r\n"
-                b"Connection: close\r\n\r\n"
-            )
-            writer.write(req)
-            await writer.drain()
-            res = await asyncio.wait_for(reader.read(1024), timeout=3.0)
-            low = res.lower()
-            if b"success" in low or b"200 ok" in low:
+        probe_specs = [
+            ("detectportal.firefox.com", "/success.txt", (200,), (b"success",)),
+            ("www.gstatic.com", "/generate_204", (204,), ()),
+        ]
+
+        for host, path, ok_codes, markers in probe_specs:
+            try:
+                req = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    "User-Agent: Mozilla/5.0\r\n"
+                    "Accept: */*\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("utf-8", errors="ignore")
+                writer.write(req)
+                await writer.drain()
+                res = await asyncio.wait_for(reader.read(1024), timeout=3.0)
+                low = (res or b"").lower()
+                if not low:
+                    continue
+
+                head = low.split(b"\r\n", 1)[0]
+                code = None
+                try:
+                    ps = head.split()
+                    if len(ps) >= 2:
+                        code = int(ps[1])
+                except Exception:
+                    code = None
+                if code not in set(int(x) for x in ok_codes):
+                    continue
+
+                if markers:
+                    if any(m.lower() in low for m in markers):
+                        return True
+                    continue
                 return True
-        except Exception:
-            pass
+            except Exception:
+                continue
         return False
 
     writer = None
@@ -2711,6 +2736,7 @@ async def audit_socks5(
 
 async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     ports_raw = ",".join(str(p) for p in ports)
+    recent_buffer = deque(maxlen=6)
     state = {
         "status": "running",
         "pid": os.getpid(),
@@ -2740,7 +2766,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "current_port": "-",
         "verify_line": "-",
         "work_mode": work_mode,
-        "recent": [],
+        "recent": list(recent_buffer),
         "skipped_resume": 0,
         "skipped_history": 0,
         "feeding_done": False,
@@ -2748,6 +2774,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "current": "Initializing...",
     }
     save_state(STATE_FILE, state)
+    last_flushed_state = dict(state)
     state_lock = asyncio.Lock()
     flush_stop = asyncio.Event()
     resume_cfg = load_resume_config()
@@ -2898,6 +2925,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     async def flush_state_loop():
         nonlocal last_interval_push_ts, last_daily_push_date
         nonlocal last_checkpoint_saved_size, last_checkpoint_saved_ts
+        nonlocal last_flushed_state
         last_checkpoint_ts = 0.0
         while not flush_stop.is_set():
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
@@ -2966,8 +2994,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     and last_daily_push_date != now_dt.strftime("%Y-%m-%d")
                 ):
                     should_send_daily = True
-            if state_snapshot is not None:
+            if state_snapshot is not None and state_snapshot != last_flushed_state:
                 await save_state_async(STATE_FILE, state_snapshot)
+                last_flushed_state = state_snapshot
             if checkpoint_targets is not None:
                 await save_state_async(
                     CHECKPOINT_FILE,
@@ -3039,7 +3068,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         return
                     async with state_lock:
                         for r in found_res:
-                            state["recent"] = (state["recent"] + [r])[-6:]
+                            recent_buffer.append(r)
+                        state["recent"] = list(recent_buffer)
                     for r in found_res:
                         await append_rotating_async(
                             REPORT_FILE,
