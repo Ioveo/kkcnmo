@@ -35,8 +35,6 @@ FALLBACK_NODE_FILE = os.path.join(BASE_DIR, "ip.txt")
 FALLBACK_NODE_FILE_UPPER = os.path.join(BASE_DIR, "IP.TXT")
 TOKEN_FILE = os.path.join(BASE_DIR, "tokens.list")
 FALLBACK_TOKEN_FILE = os.path.join(BASE_DIR, "pass.txt")
-IPLIB_FILE = os.path.join(BASE_DIR, "ip_lib.txt")
-IPLIB_CFG_FILE = os.path.join(BASE_DIR, "ip_lib_config.json")
 GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
@@ -72,7 +70,10 @@ ADAPT_HIGH_MB = 2048.0
 EXPOSE_SECRET_IN_REPORT = True
 # 不再限制单个网段展开上限，改为流式逐个投喂
 MAX_EXPANDED_TARGETS_PER_ENTRY = None
-DEFAULT_XUI_PORTS = "54321,2053,7777,5000"
+DEFAULT_XUI_PORTS = (
+    "54321,2053,65432,65430,8080,8880,8443,2082,2083,2095,2096,"
+    "1111,2222,6666,8888,9999,11111,12345,9527,10000"
+)
 DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
     "1234,4321,8000,9000,6868,6688,8866,9527,1472,2583,3694,10000-10010"
@@ -1001,156 +1002,6 @@ def default_resume_config():
 
 def default_guardian_control():
     return {"enabled": False}
-
-
-def default_iplib_config():
-    # enabled: 任务完成后自动从 IP 库提取并继续启动
-    # batch_size: 每轮提取行数; 1=一次一行; 0=全部
-    return {"enabled": True, "batch_size": 1}
-
-
-def load_iplib_config():
-    cfg = default_iplib_config()
-    data = load_state(IPLIB_CFG_FILE)
-    if isinstance(data, dict):
-        cfg.update(data)
-    cfg["enabled"] = bool(cfg.get("enabled", True))
-    try:
-        cfg["batch_size"] = max(0, int(cfg.get("batch_size", 1)))
-    except (TypeError, ValueError):
-        cfg["batch_size"] = 1
-    return cfg
-
-
-def save_iplib_config(cfg):
-    save_state(IPLIB_CFG_FILE, cfg)
-
-
-def _dedupe_keep_order(items):
-    seen = set()
-    out = []
-    for x in items:
-        x = str(x or "").strip()
-        if not x or x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
-def _read_tokens_flat(path):
-    rows = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if (not line) or line.startswith("#"):
-                    continue
-                rows.extend([x for x in line.split() if x.strip()])
-    except OSError:
-        return []
-    return rows
-
-
-def _read_clean_lines(path):
-    rows = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if (not line) or line.startswith("#"):
-                    continue
-                rows.append(line)
-    except OSError:
-        return []
-    return rows
-
-
-def _write_targets_tokens_to_file(path, tokens):
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            for x in tokens:
-                x = str(x or "").strip()
-                if x:
-                    f.write(x + "\n")
-        os.replace(tmp, path)
-        return True
-    except OSError:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        return False
-
-
-def read_list_tokens_from_input(split_spaces=True):
-    print("请输入内容，单独输入 EOF 结束:")
-    rows = []
-    while True:
-        try:
-            raw = input()
-        except KeyboardInterrupt:
-            print("\n已取消输入。")
-            return None
-        if raw.strip() == "EOF":
-            break
-        if split_spaces:
-            parts = [x.strip() for x in raw.strip().split() if x.strip()]
-            rows.extend(parts)
-        else:
-            line = raw.strip()
-            if line:
-                rows.append(line)
-    return rows
-
-
-def iplib_count():
-    return len(_read_clean_lines(IPLIB_FILE))
-
-
-def iplib_overwrite(tokens):
-    tokens = _dedupe_keep_order(tokens or [])
-    return _write_targets_tokens_to_file(IPLIB_FILE, tokens), len(tokens)
-
-
-def iplib_append(tokens):
-    tokens = list(tokens or [])
-    existing = _read_clean_lines(IPLIB_FILE)
-    merged = _dedupe_keep_order(existing + tokens)
-    return _write_targets_tokens_to_file(IPLIB_FILE, merged), len(merged)
-
-
-def iplib_clear():
-    return _write_targets_tokens_to_file(IPLIB_FILE, [])
-
-
-def iplib_pop_to_nodes(batch_size=0):
-    all_lines = _read_clean_lines(IPLIB_FILE)
-    if not all_lines:
-        return 0, 0
-    try:
-        n = max(0, int(batch_size or 0))
-    except (TypeError, ValueError):
-        n = 0
-    take_lines = all_lines if n <= 0 else all_lines[:n]
-    rest_lines = [] if n <= 0 else all_lines[n:]
-
-    # 一次按“行”提取；写入 nodes.list 时按行展开为目标
-    take_tokens = []
-    for line in take_lines:
-        take_tokens.extend([x for x in str(line).split() if x.strip()])
-    take_tokens = _dedupe_keep_order(take_tokens)
-    if not take_tokens:
-        _write_targets_tokens_to_file(IPLIB_FILE, rest_lines)
-        return 0, len(rest_lines)
-
-    ok = _write_targets_tokens_to_file(NODE_FILE, take_tokens)
-    if not ok:
-        return 0, len(all_lines)
-    _write_targets_tokens_to_file(IPLIB_FILE, rest_lines)
-    return len(take_lines), len(rest_lines)
 
 
 def load_guardian_control():
@@ -3801,7 +3652,6 @@ def main_console():
                     (18, "一键清理"),
                     (19, "初始化"),
                     (20, "项目备注"),
-                    (21, "IP库"),
                 ],
             ),
             ("系统", [(0, "退出")]),
@@ -4443,124 +4293,6 @@ def main_console():
                 print(f"{C_SUCC}>>> 备注已更新{C_W}")
             time.sleep(1.2)
 
-        elif c == "21":
-            while True:
-                cfg = load_iplib_config()
-                lib_n = iplib_count()
-                os.system("cls" if os.name == "nt" else "clear")
-                print(f"\n{C_CYAN}>>> IP库管理 ({IPLIB_FILE}){C_W}")
-                print(
-                    f"状态: {'自动续跑ON' if cfg.get('enabled') else '自动续跑OFF'} | "
-                    f"每轮提取行数: {cfg.get('batch_size', 1) or 1} (1=一次一行, 0=全部) | 库内行数: {lib_n}"
-                )
-                print("1) 覆盖写入 IP库")
-                print("2) 追加写入 IP库")
-                print(f"3) 将当前 {NODE_FILE} 追加到 IP库")
-                print("4) 清空 IP库")
-                print("5) 切换 自动续跑 开/关")
-                print("6) 设置 每轮提取行数")
-                print(f"7) 立即从 IP库 提取到 {NODE_FILE}")
-                sel = input("请选择 (回车返回): ").strip()
-                if sel == "":
-                    break
-
-                if sel == "1":
-                    print(f"\n{C_CYAN}>>> 覆盖写入 IP库{C_W}")
-                    tokens = read_list_tokens_from_input(split_spaces=True)
-                    if tokens is None:
-                        time.sleep(0.8)
-                        continue
-                    ok, n = iplib_overwrite(tokens)
-                    if ok:
-                        print(f"{C_SUCC}>>> IP库已更新，共 {n} 条{C_W}")
-                    else:
-                        print(f"{C_WARN}>>> 写入失败{C_W}")
-                    time.sleep(1.0)
-
-                elif sel == "2":
-                    print(f"\n{C_CYAN}>>> 追加写入 IP库{C_W}")
-                    tokens = read_list_tokens_from_input(split_spaces=True)
-                    if tokens is None:
-                        time.sleep(0.8)
-                        continue
-                    ok, n = iplib_append(tokens)
-                    if ok:
-                        print(f"{C_SUCC}>>> 已追加，库内共 {n} 条{C_W}")
-                    else:
-                        print(f"{C_WARN}>>> 写入失败{C_W}")
-                    time.sleep(1.0)
-
-                elif sel == "3":
-                    cur = _read_tokens_flat(NODE_FILE)
-                    if not cur:
-                        print(f"{C_WARN}>>> {NODE_FILE} 为空或不存在{C_W}")
-                        time.sleep(1.0)
-                        continue
-                    ok, n = iplib_append(cur)
-                    if ok:
-                        print(
-                            f"{C_SUCC}>>> 已从 {NODE_FILE} 追加到 IP库，库内共 {n} 行{C_W}"
-                        )
-                    else:
-                        print(f"{C_WARN}>>> 写入失败{C_W}")
-                    time.sleep(1.0)
-
-                elif sel == "4":
-                    sure = input("确认清空 IP库? (y/n): ").strip().lower()
-                    if sure == "y":
-                        ok = iplib_clear()
-                        print(
-                            f"{C_SUCC if ok else C_WARN}>>> IP库已清空{C_W}"
-                            if ok
-                            else f"{C_WARN}>>> 清空失败{C_W}"
-                        )
-                    else:
-                        print(f"{C_DIM}已取消{C_W}")
-                    time.sleep(1.0)
-
-                elif sel == "5":
-                    cfg["enabled"] = not bool(cfg.get("enabled"))
-                    save_iplib_config(cfg)
-                    print(
-                        f"{C_SUCC}>>> 自动续跑已{'开启' if cfg['enabled'] else '关闭'}{C_W}"
-                    )
-                    time.sleep(1.0)
-
-                elif sel == "6":
-                    bs = prompt_int(
-                        "每轮提取行数 (1=一次一行, 0=全部): ",
-                        default=int(cfg.get("batch_size", 1) or 1),
-                        min_value=0,
-                        max_value=100000000,
-                    )
-                    cfg["batch_size"] = bs
-                    save_iplib_config(cfg)
-                    print(f"{C_SUCC}>>> 已保存: 每轮提取行数 {bs}{C_W}")
-                    time.sleep(1.0)
-
-                elif sel == "7":
-                    take, left = iplib_pop_to_nodes(cfg.get("batch_size", 0))
-                    if take <= 0:
-                        print(f"{C_WARN}>>> IP库为空或提取失败{C_W}")
-                    else:
-                        print(
-                            f"{C_SUCC}>>> 已提取 {take} 行到 {NODE_FILE}，IP库剩余 {left} 行{C_W}"
-                        )
-                        reload_now = (
-                            input("是否立即重载当前审计任务? (y/n): ").strip().lower()
-                        )
-                        if reload_now == "y":
-                            ok, detail = reload_running_audit()
-                            if ok:
-                                print(f"{C_SUCC}>>> {detail}{C_W}")
-                            else:
-                                print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
-                    time.sleep(1.2)
-
-                else:
-                    print(f"{C_WARN}无效选项{C_W}")
-                    time.sleep(1.0)
-
         elif c == "13":
             print(f"\n{C_CYAN}>>> 更换 IP 列表 ({NODE_FILE}){C_W}")
             print(f"{C_DIM}支持空格/换行混合输入，保存后自动按一行一个目标整理{C_W}")
@@ -4656,38 +4388,11 @@ if __name__ == "__main__":
             asyncio.run(
                 internal_audit_process(mode, work_mode, threads, ports, feed_int)
             )
-            ran_ok = True
         except Exception:
-            ran_ok = False
             log_exception("fatal crash in run mode")
             raise
         finally:
             release_run_lock()
-
-        # 任务正常结束后: 自动从 IP 库提取并继续跑同一模式
-        if ran_ok:
-            try:
-                cfg = load_iplib_config()
-                if cfg.get("enabled"):
-                    take, left = iplib_pop_to_nodes(cfg.get("batch_size", 0))
-                    if take > 0:
-                        log_event(f"IPLIB auto-continue: extracted {take}, left {left}")
-                        mark_manual_launch_window(20)
-                        subprocess.Popen(
-                            [
-                                sys.executable,
-                                __file__,
-                                "run",
-                                str(mode),
-                                str(work_mode),
-                                str(threads),
-                                str(sys.argv[5]),
-                                str(feed_int),
-                            ],
-                            start_new_session=True,
-                        )
-            except Exception:
-                log_exception("iplib auto-continue failed")
     elif len(sys.argv) > 1 and sys.argv[1] == "guardian":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 6:
