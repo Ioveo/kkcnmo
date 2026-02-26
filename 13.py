@@ -19,6 +19,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import gc
+from collections import deque
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -34,10 +35,13 @@ FALLBACK_NODE_FILE = os.path.join(BASE_DIR, "ip.txt")
 FALLBACK_NODE_FILE_UPPER = os.path.join(BASE_DIR, "IP.TXT")
 TOKEN_FILE = os.path.join(BASE_DIR, "tokens.list")
 FALLBACK_TOKEN_FILE = os.path.join(BASE_DIR, "pass.txt")
+IPLIB_FILE = os.path.join(BASE_DIR, "ip_lib.txt")
+IPLIB_CFG_FILE = os.path.join(BASE_DIR, "ip_lib_config.json")
 GUARDIAN_STATE_FILE = os.path.join(BASE_DIR, "sys_guardian_state.json")
 TELEGRAM_CFG_FILE = os.path.join(BASE_DIR, "telegram_notify.json")
 RESUME_CFG_FILE = os.path.join(BASE_DIR, "resume_config.json")
 FEED_CFG_FILE = os.path.join(BASE_DIR, "feed_turbo_config.json")
+PROJECT_NOTE_FILE = os.path.join(BASE_DIR, "project_note.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "audit_checkpoint.json")
 VERIFIED_EVENTS_FILE = os.path.join(BASE_DIR, "verified_events.log")
 RUN_LOCK_FILE = os.path.join(BASE_DIR, "audit_runner.lock")
@@ -50,11 +54,11 @@ MAX_VERIFIED_EVENTS_BYTES = 4 * 1024 * 1024
 LOG_BACKUPS = 5
 REPORT_BACKUPS = 3
 VERIFIED_EVENTS_BACKUPS = 2
-STATE_FLUSH_INTERVAL = 1.0
-CHECKPOINT_FLUSH_INTERVAL = 3.0
+STATE_FLUSH_INTERVAL = 2.0
+CHECKPOINT_FLUSH_INTERVAL = 5.0
 CHECKPOINT_GROWTH_STEP = 500
 CHECKPOINT_MAX_IDLE_FLUSH_SEC = 30.0
-MAX_SOCKET_CONCURRENCY = 600
+MAX_SOCKET_CONCURRENCY = 500
 FEED_ACCEL_TRIGGER_RATIO = 0.5
 FEED_FINAL_RUSH_RATIO = 0.1
 FEED_ACCEL_FACTOR = 0.5
@@ -65,10 +69,10 @@ ADAPT_STEP_UP = 50
 ADAPT_STEP_DOWN = 100
 ADAPT_LOW_MB = 800.0
 ADAPT_HIGH_MB = 2048.0
-EXPOSE_SECRET_IN_REPORT = True
+EXPOSE_SECRET_IN_REPORT = False
 # 不再限制单个网段展开上限，改为流式逐个投喂
 MAX_EXPANDED_TARGETS_PER_ENTRY = None
-DEFAULT_XUI_PORTS = "54321,2053"
+DEFAULT_XUI_PORTS = "54321,2053,7777,5000"
 DEFAULT_S5_PORTS = (
     "1080-1090,1111,2222,3333,4444,5555,6666,7777,8888,9999,"
     "1234,4321,8000,9000,6868,6688,8866,9527,1472,2583,3694,10000-10010"
@@ -80,6 +84,111 @@ DEFAULT_S5_PORTS_HIGH = (
 )
 DEFAULT_MIXED_PORTS = f"{DEFAULT_XUI_PORTS},{DEFAULT_S5_PORTS}"
 DEFAULT_MIXED_PORTS_HIGH = f"{DEFAULT_XUI_PORTS},{DEFAULT_S5_PORTS_HIGH}"
+DEFAULT_FOFA_TOP100_PORTS = ",".join(
+    str(x)
+    for x in [
+        80,
+        81,
+        82,
+        83,
+        88,
+        89,
+        90,
+        95,
+        96,
+        98,
+        99,
+        100,
+        101,
+        102,
+        1080,
+        1081,
+        1082,
+        1083,
+        1084,
+        1085,
+        1086,
+        1087,
+        1088,
+        1089,
+        1090,
+        1100,
+        1111,
+        1180,
+        1200,
+        1234,
+        1314,
+        1433,
+        1521,
+        1680,
+        1880,
+        1900,
+        2000,
+        2001,
+        2002,
+        2080,
+        2082,
+        2083,
+        2086,
+        2087,
+        2095,
+        3000,
+        3001,
+        3002,
+        3128,
+        3333,
+        4000,
+        4001,
+        4002,
+        4145,
+        4321,
+        4444,
+        5000,
+        5001,
+        5432,
+        5555,
+        5601,
+        5678,
+        5683,
+        6000,
+        6001,
+        6080,
+        6379,
+        6443,
+        6666,
+        7000,
+        7001,
+        7002,
+        7003,
+        7080,
+        7443,
+        7547,
+        7777,
+        7800,
+        8000,
+        8001,
+        8008,
+        8010,
+        8080,
+        8081,
+        8082,
+        8083,
+        8086,
+        8087,
+        8088,
+        8089,
+        8090,
+        8181,
+        8443,
+        8800,
+        8880,
+        8888,
+        9000,
+        9090,
+        9443,
+        10000,
+    ]
+)
 ASN_DB_FILE = os.path.join(BASE_DIR, "GeoLite2-ASN.mmdb")
 COUNTRY_DB_CANDIDATES = [
     os.path.join(BASE_DIR, "GeoLite2-Country.mmdb"),
@@ -92,7 +201,51 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
 ]
+
+
+def random_user_agent():
+    return random.choice(USER_AGENTS)
+
+
+def random_headers():
+    ua = random_user_agent()
+    accept_langs = [
+        "en-US,en;q=0.9",
+        "zh-CN,zh;q=0.9",
+        "zh-TW,zh;q=0.9",
+        "en-GB,en;q=0.8",
+        "ja-JP,ja;q=0.9",
+    ]
+    referers = [
+        "https://www.google.com/",
+        "https://www.bing.com/",
+        "https://www.baidu.com/",
+        "",
+    ]
+    return {
+        "User-Agent": ua,
+        "Accept-Language": random.choice(accept_langs),
+        "Referer": random.choice(referers),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    }
+
 
 # 视觉配置 (极光配色)
 C_BOLD, C_W = "\033[1m", "\033[0m"
@@ -110,6 +263,14 @@ C_DIM = "\033[2m"  # 暗色
 
 def now_ts():
     return time.time()
+
+
+def jitter_interval(base_interval, factor=0.5):
+    """返回带有随机抖动的间隔时间，波动范围 [base * (1-factor), base * (1+factor)]"""
+    if base_interval <= 0:
+        return 0
+    jitter = base_interval * factor * 2
+    return max(0, base_interval - jitter + random.random() * jitter * 2)
 
 
 async def close_writer(writer):
@@ -614,8 +775,76 @@ def one_key_cleanup():
     stopped += stop_guardian_processes_fallback()
 
     removed = cleanup_runtime_files()
-    gc.collect()
-    return stopped, removed
+    mem_info = compact_process_memory()
+    return stopped, removed, mem_info
+
+
+def compact_process_memory():
+    before_mb = get_available_memory_mb()
+
+    for _ in range(3):
+        gc.collect()
+
+    trimmed = False
+    if os.name == "nt":
+        try:
+            hproc = ctypes.windll.kernel32.GetCurrentProcess()
+            if hproc:
+                trimmed = bool(ctypes.windll.psapi.EmptyWorkingSet(hproc))
+        except Exception:
+            trimmed = False
+    else:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                trimmed = bool(libc.malloc_trim(0))
+        except Exception:
+            trimmed = False
+
+    after_mb = get_available_memory_mb()
+    freed_mb = None
+    if isinstance(before_mb, (int, float)) and isinstance(after_mb, (int, float)):
+        freed_mb = round(after_mb - before_mb, 1)
+
+    return {
+        "before_mb": before_mb,
+        "after_mb": after_mb,
+        "freed_mb": freed_mb,
+        "trimmed": trimmed,
+    }
+
+
+def init_account_environment(keep_profile=True, keep_ports=True):
+    stopped, removed, mem_info = one_key_cleanup()
+    removed_profile = 0
+
+    if not keep_profile:
+        profile_files = [
+            NODE_FILE,
+            FALLBACK_NODE_FILE,
+            FALLBACK_NODE_FILE_UPPER,
+            TOKEN_FILE,
+            FALLBACK_TOKEN_FILE,
+            TELEGRAM_CFG_FILE,
+            RESUME_CFG_FILE,
+            FEED_CFG_FILE,
+        ]
+        for p in profile_files:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                    removed_profile += 1
+            except OSError:
+                pass
+
+    # 当前工具不维护系统级端口占用表；keep_ports=True 表示不做任何端口释放动作。
+    return {
+        "stopped": stopped,
+        "removed_runtime": removed,
+        "removed_profile": removed_profile,
+        "keep_ports": bool(keep_ports),
+        "mem_info": mem_info,
+    }
 
 
 def disable_and_stop_guardian_processes():
@@ -655,11 +884,12 @@ def reload_running_audit():
         return False, "当前任务参数不完整，无法重载"
 
     ports = parse_ports(ports_raw)
+    needs_ports = mode in (1, 2, 3)
     if (
         mode not in (1, 2, 3, 4)
         or work_mode not in (1, 2, 3)
         or threads < 1
-        or not ports
+        or (needs_ports and not ports)
     ):
         return False, "当前任务参数无效，无法重载"
 
@@ -736,7 +966,7 @@ def mode_label(mode):
 
 
 def work_mode_label(work_mode):
-    return {1: "探索", 2: "探索+验真", 3: "直跑验真"}.get(work_mode, str(work_mode))
+    return {1: "探索", 2: "探索+验真", 3: "只留极品"}.get(work_mode, str(work_mode))
 
 
 def render_progress_bar(done, total, width=28):
@@ -768,6 +998,37 @@ def resolve_token_file():
     return None
 
 
+def load_tokens_list():
+    tokens = []
+    token_file = resolve_token_file()
+    if not token_file:
+        return tokens
+    try:
+        with open(token_file, "r", encoding="utf-8", errors="ignore") as f:
+            for l in f:
+                l = l.strip()
+                if (not l) or l.startswith("#"):
+                    continue
+                if ":" in l:
+                    u, p = l.split(":", 1)
+                    u = u.strip()
+                    p = p.strip()
+                    if (not u) and (not p):
+                        continue
+                    if not u:
+                        u = "admin"
+                    if not p:
+                        continue
+                    tokens.append([u, p])
+                else:
+                    p = l.strip()
+                    if p:
+                        tokens.append(["admin", p])
+    except OSError:
+        return []
+    return tokens
+
+
 def mask_secret(secret):
     if EXPOSE_SECRET_IN_REPORT:
         return secret
@@ -792,6 +1053,156 @@ def default_resume_config():
 
 def default_guardian_control():
     return {"enabled": False}
+
+
+def default_iplib_config():
+    # enabled: 任务完成后自动从 IP 库提取并继续启动
+    # batch_size: 每轮提取行数; 1=一次一行; 0=全部
+    return {"enabled": True, "batch_size": 1}
+
+
+def load_iplib_config():
+    cfg = default_iplib_config()
+    data = load_state(IPLIB_CFG_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+    cfg["enabled"] = bool(cfg.get("enabled", True))
+    try:
+        cfg["batch_size"] = max(0, int(cfg.get("batch_size", 1)))
+    except (TypeError, ValueError):
+        cfg["batch_size"] = 1
+    return cfg
+
+
+def save_iplib_config(cfg):
+    save_state(IPLIB_CFG_FILE, cfg)
+
+
+def _dedupe_keep_order(items):
+    seen = set()
+    out = []
+    for x in items:
+        x = str(x or "").strip()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _read_tokens_flat(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if (not line) or line.startswith("#"):
+                    continue
+                rows.extend([x for x in line.split() if x.strip()])
+    except OSError:
+        return []
+    return rows
+
+
+def _read_clean_lines(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if (not line) or line.startswith("#"):
+                    continue
+                rows.append(line)
+    except OSError:
+        return []
+    return rows
+
+
+def _write_targets_tokens_to_file(path, tokens):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for x in tokens:
+                x = str(x or "").strip()
+                if x:
+                    f.write(x + "\n")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def read_list_tokens_from_input(split_spaces=True):
+    print("请输入内容，单独输入 EOF 结束:")
+    rows = []
+    while True:
+        try:
+            raw = input()
+        except KeyboardInterrupt:
+            print("\n已取消输入。")
+            return None
+        if raw.strip() == "EOF":
+            break
+        if split_spaces:
+            parts = [x.strip() for x in raw.strip().split() if x.strip()]
+            rows.extend(parts)
+        else:
+            line = raw.strip()
+            if line:
+                rows.append(line)
+    return rows
+
+
+def iplib_count():
+    return len(_read_clean_lines(IPLIB_FILE))
+
+
+def iplib_overwrite(tokens):
+    tokens = _dedupe_keep_order(tokens or [])
+    return _write_targets_tokens_to_file(IPLIB_FILE, tokens), len(tokens)
+
+
+def iplib_append(tokens):
+    tokens = list(tokens or [])
+    existing = _read_clean_lines(IPLIB_FILE)
+    merged = _dedupe_keep_order(existing + tokens)
+    return _write_targets_tokens_to_file(IPLIB_FILE, merged), len(merged)
+
+
+def iplib_clear():
+    return _write_targets_tokens_to_file(IPLIB_FILE, [])
+
+
+def iplib_pop_to_nodes(batch_size=0):
+    all_lines = _read_clean_lines(IPLIB_FILE)
+    if not all_lines:
+        return 0, 0
+    try:
+        n = max(0, int(batch_size or 0))
+    except (TypeError, ValueError):
+        n = 0
+    take_lines = all_lines if n <= 0 else all_lines[:n]
+    rest_lines = [] if n <= 0 else all_lines[n:]
+
+    # 一次按“行”提取；写入 nodes.list 时按行展开为目标
+    take_tokens = []
+    for line in take_lines:
+        take_tokens.extend([x for x in str(line).split() if x.strip()])
+    take_tokens = _dedupe_keep_order(take_tokens)
+    if not take_tokens:
+        _write_targets_tokens_to_file(IPLIB_FILE, rest_lines)
+        return 0, len(rest_lines)
+
+    ok = _write_targets_tokens_to_file(NODE_FILE, take_tokens)
+    if not ok:
+        return 0, len(all_lines)
+    _write_targets_tokens_to_file(IPLIB_FILE, rest_lines)
+    return len(take_lines), len(rest_lines)
 
 
 def load_guardian_control():
@@ -905,6 +1316,19 @@ def load_feed_turbo_config():
 
 def save_feed_turbo_config(cfg):
     save_state(FEED_CFG_FILE, cfg)
+
+
+def load_project_note():
+    data = load_state(PROJECT_NOTE_FILE)
+    if not isinstance(data, dict):
+        return ""
+    note = str(data.get("note", "") or "").strip()
+    return note[:120]
+
+
+def save_project_note(note):
+    txt = str(note or "").strip()[:120]
+    save_state(PROJECT_NOTE_FILE, {"note": txt, "updated_at": now_ts()})
 
 
 def clear_checkpoint():
@@ -1345,6 +1769,36 @@ def iter_expanded_targets(raw_target):
             pass
 
     yield target
+
+
+async def iter_targets_from_file_stream(file_path, max_queue_size=100):
+    """异步流式从文件读取目标，避免一次性加载大文件到内存"""
+    queue = asyncio.Queue(maxsize=max_queue_size)
+
+    async def read_file_task():
+        try:
+            loop = asyncio.get_event_loop()
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for target in iter_expanded_targets(line):
+                        await queue.put(target)
+        except Exception:
+            pass
+        finally:
+            await queue.put(None)
+
+    reader_task = asyncio.create_task(read_file_task())
+
+    while True:
+        target = await queue.get()
+        if target is None:
+            break
+        yield target
+
+    await reader_task
 
 
 def estimate_expanded_target_count(raw_target):
@@ -2154,6 +2608,7 @@ async def audit_xui(
     work_mode,
     conn_limiter,
     token_sem=None,
+    force_verify=False,
 ):
     async def fetch_page(path, use_ssl=False, method="GET", payload=""):
         writer = None
@@ -2175,6 +2630,14 @@ async def audit_xui(
             writer.write(req.encode("utf-8", errors="ignore"))
             await writer.drain()
             return await asyncio.wait_for(reader.read(16384), timeout=4.0)
+        except asyncio.TimeoutError:
+            return b""
+        except ConnectionRefusedError:
+            return b""
+        except ConnectionResetError:
+            return b""
+        except OSError as e:
+            return b""
         except Exception:
             return b""
         finally:
@@ -2210,7 +2673,50 @@ async def audit_xui(
             return True
         return False
 
-    probes_to_try = [("/", False), ("/login", False), ("/", True), ("/login", True)]
+    probes_to_try = [
+        ("/", False),
+        ("/login", False),
+        ("/", True),
+        ("/login", True),
+        ("/xui", False),
+        ("/xui/login", False),
+        ("/xui", True),
+        ("/xui/login", True),
+        ("/panel", False),
+        ("/panel/login", False),
+        ("/panel", True),
+        ("/panel/login", True),
+        ("/auth/login", False),
+        ("/auth/login", True),
+    ]
+
+    XUI_FINGERPRINTS = [
+        b"x-ui",
+        b"xui",
+        b"x-ui panel",
+        b"x-ui dashboard",
+        b"vaxilu",
+        b"franzkafkayu",
+        b"3x-ui",
+        b"browse: client",
+        b"traffic: in",
+        b"inbounds:",
+        b"outbounds:",
+        b"panel for xray",
+        b"v2ray panel",
+    ]
+
+    def enhanced_match_xui(data):
+        if match_xui(data):
+            return True
+        if not data:
+            return False
+        low = data.lower()
+        for fp in XUI_FINGERPRINTS:
+            if fp in low:
+                return True
+        return False
+
     tried = set()
     found_candidates = []
     counted_xui_found = False
@@ -2230,7 +2736,7 @@ async def audit_xui(
             if loc.startswith("/") and (loc, use_ssl) not in tried:
                 probes_to_try.append((loc, use_ssl))
 
-        if match_xui(data):
+        if enhanced_match_xui(data):
             proto = "https" if use_ssl else "http"
             country, asn = get_geo_info(ip)
             login_path = path if "login" in path else path.rstrip("/") + "/login"
@@ -2245,7 +2751,7 @@ async def audit_xui(
                 return f"[XUI_FOUND] [资产-面板存活] {ip}:{port} | {country} | {asn} | 协议:{proto} 路径:{path}"
             continue
 
-    if work_mode == 3 and tokens and not found_candidates:
+    if force_verify and tokens and not found_candidates:
         country, asn = get_geo_info(ip)
         direct_login_paths = ["/login", "/xui/login", "/auth/login"]
         found_candidates = []
@@ -2314,21 +2820,45 @@ async def audit_socks5(
     token_sem=None,
 ):
     async def check_l7(reader, writer):
-        try:
-            req = (
-                b"GET /hotspot-detect.html HTTP/1.1\r\n"
-                b"Host: captive.apple.com\r\n"
-                b"User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15\r\n"
-                b"Connection: close\r\n\r\n"
-            )
-            writer.write(req)
-            await writer.drain()
-            res = await asyncio.wait_for(reader.read(1024), timeout=3.0)
-            low = res.lower()
-            if b"success" in low or b"200 ok" in low:
+        probe_specs = [
+            ("detectportal.firefox.com", "/success.txt", (200,), (b"success",)),
+            ("www.gstatic.com", "/generate_204", (204,), ()),
+        ]
+
+        for host, path, ok_codes, markers in probe_specs:
+            try:
+                req = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    "User-Agent: Mozilla/5.0\r\n"
+                    "Accept: */*\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("utf-8", errors="ignore")
+                writer.write(req)
+                await writer.drain()
+                res = await asyncio.wait_for(reader.read(1024), timeout=3.0)
+                low = (res or b"").lower()
+                if not low:
+                    continue
+
+                head = low.split(b"\r\n", 1)[0]
+                code = None
+                try:
+                    ps = head.split()
+                    if len(ps) >= 2:
+                        code = int(ps[1])
+                except Exception:
+                    code = None
+                if code not in set(int(x) for x in ok_codes):
+                    continue
+
+                if markers:
+                    if any(m.lower() in low for m in markers):
+                        return True
+                    continue
                 return True
-        except Exception:
-            pass
+            except Exception:
+                continue
         return False
 
     writer = None
@@ -2476,7 +3006,17 @@ async def audit_socks5(
 
             if work_mode in (2, 3):
                 return f"[S5_FOUND] [节点-可连通] {ip}:{port} | S5-AUTH | {country} | {asn} | 字典未命中"
-    except (asyncio.TimeoutError, asyncio.IncompleteReadError, OSError, ValueError):
+    except asyncio.TimeoutError:
+        pass
+    except asyncio.IncompleteReadError:
+        pass
+    except ConnectionRefusedError:
+        pass
+    except ConnectionResetError:
+        pass
+    except OSError as e:
+        pass
+    except Exception:
         pass
     finally:
         await close_writer(writer)
@@ -2488,6 +3028,7 @@ async def audit_socks5(
 
 async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     ports_raw = ",".join(str(p) for p in ports)
+    recent_buffer = deque(maxlen=6)
     state = {
         "status": "running",
         "pid": os.getpid(),
@@ -2504,6 +3045,10 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "xui_verified": 0,
         "s5_found": 0,
         "s5_verified": 0,
+        "verify_checked": 0,
+        "verify_alive": 0,
+        "verify_invalid": 0,
+        "verify_noport": 0,
         "verifying_ip_count": 0,
         "active_workers": 0,
         "queue_size": 0,
@@ -2513,7 +3058,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "current_port": "-",
         "verify_line": "-",
         "work_mode": work_mode,
-        "recent": [],
+        "recent": list(recent_buffer),
         "skipped_resume": 0,
         "skipped_history": 0,
         "feeding_done": False,
@@ -2521,6 +3066,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
         "current": "Initializing...",
     }
     save_state(STATE_FILE, state)
+    last_flushed_state = dict(state)
     state_lock = asyncio.Lock()
     flush_stop = asyncio.Event()
     resume_cfg = load_resume_config()
@@ -2671,6 +3217,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     async def flush_state_loop():
         nonlocal last_interval_push_ts, last_daily_push_date
         nonlocal last_checkpoint_saved_size, last_checkpoint_saved_ts
+        nonlocal last_flushed_state
         last_checkpoint_ts = 0.0
         while not flush_stop.is_set():
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
@@ -2739,8 +3286,9 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     and last_daily_push_date != now_dt.strftime("%Y-%m-%d")
                 ):
                     should_send_daily = True
-            if state_snapshot is not None:
+            if state_snapshot is not None and state_snapshot != last_flushed_state:
                 await save_state_async(STATE_FILE, state_snapshot)
+                last_flushed_state = state_snapshot
             if checkpoint_targets is not None:
                 await save_state_async(
                     CHECKPOINT_FILE,
@@ -2787,29 +3335,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
     flusher = asyncio.create_task(flush_state_loop())
     adaptive_task = asyncio.create_task(adaptive_conn_loop())
 
-    tokens = []
-    token_file = resolve_token_file()
-    if token_file:
-        with open(token_file, "r", encoding="utf-8", errors="ignore") as f:
-            for l in f:
-                l = l.strip()
-                if (not l) or l.startswith("#"):
-                    continue
-                if ":" in l:
-                    u, p = l.split(":", 1)
-                    u = u.strip()
-                    p = p.strip()
-                    if (not u) and (not p):
-                        continue
-                    if not u:
-                        u = "admin"
-                    if not p:
-                        continue
-                    tokens.append([u, p])
-                else:
-                    p = l.strip()
-                    if p:
-                        tokens.append(["admin", p])
+    tokens = load_tokens_list()
     async with state_lock:
         state["tokens_loaded"] = len(tokens)
 
@@ -2834,7 +3360,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                         return
                     async with state_lock:
                         for r in found_res:
-                            state["recent"] = (state["recent"] + [r])[-6:]
+                            recent_buffer.append(r)
+                        state["recent"] = list(recent_buffer)
                     for r in found_res:
                         await append_rotating_async(
                             REPORT_FILE,
@@ -2863,6 +3390,24 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                                 build_interval_message(matched_snapshot, matched)
                             )
 
+                async def check_target_alive(ip_addr, port_num):
+                    writer_chk = None
+                    try:
+                        async with conn_limiter:
+                            _, writer_chk = await asyncio.wait_for(
+                                asyncio.open_connection(ip_addr, port_num), timeout=2.2
+                            )
+                        return True
+                    except (
+                        asyncio.TimeoutError,
+                        asyncio.IncompleteReadError,
+                        OSError,
+                        ValueError,
+                    ):
+                        return False
+                    finally:
+                        await close_writer(writer_chk)
+
                 if mode in (1, 3):
                     for p in xui_ports:
                         async with state_lock:
@@ -2877,6 +3422,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             work_mode,
                             conn_limiter,
                             token_sem,
+                            False,
                         )
                         if x_r:
                             await handle_found_results([x_r])
@@ -2906,6 +3452,23 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                     verified_hit = False
                     for p in verify_ports:
                         async with state_lock:
+                            state["current_service"] = "TCP-CHECK"
+                            state["current_port"] = str(p)
+                            state["current"] = f"Probe -> {ip}:{p}"
+
+                        alive = await check_target_alive(ip, p)
+                        async with state_lock:
+                            state["verify_checked"] = state.get("verify_checked", 0) + 1
+                            if alive:
+                                state["verify_alive"] = state.get("verify_alive", 0) + 1
+                                state["verify_line"] = f"PROBE_OK {ip}:{p}"
+                            else:
+                                state["verify_line"] = f"PROBE_FAIL {ip}:{p}"
+
+                        if not alive:
+                            continue
+
+                        async with state_lock:
                             state["current_service"] = "XUI-VERIFY"
                             state["current_port"] = str(p)
                         x_r = await audit_xui(
@@ -2917,6 +3480,7 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             3,
                             conn_limiter,
                             token_sem,
+                            True,
                         )
                         if x_r and is_verified_output_line(x_r):
                             await handle_found_results([x_r])
@@ -3039,8 +3603,21 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                             if ip0 and p0:
                                 target_items.append((ip0, p0, f"{ip0}:{p0}"))
                             else:
-                                for target in iter_expanded_targets(raw_target):
-                                    target_items.append((target, None, target))
+                                is_plain_ip = False
+                                try:
+                                    ipaddress.ip_address(raw_target)
+                                    is_plain_ip = True
+                                except ValueError:
+                                    is_plain_ip = False
+                                async with state_lock:
+                                    state["verify_invalid"] = (
+                                        state.get("verify_invalid", 0) + 1
+                                    )
+                                    if is_plain_ip:
+                                        state["verify_noport"] = (
+                                            state.get("verify_noport", 0) + 1
+                                        )
+                                continue
                         else:
                             for target in iter_expanded_targets(raw_target):
                                 target_items.append((target, None, target))
@@ -3132,7 +3709,7 @@ def main_console():
     spin_idx = 0
     panel_inner = 74
     panel_border = C_BLUE
-    panel_rows = 9
+    panel_rows = 10
 
     def visible_width(text):
         clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -3287,8 +3864,13 @@ def main_console():
             else f"{C_DIM}OFF{C_W}"
         )
         mode_text = mode_label(s.get("mode", 3))
+        project_note = load_project_note()
         queue_size = int(s.get("queue_size", 0))
         tokens_loaded = int(s.get("tokens_loaded", 0))
+        verify_checked = int(s.get("verify_checked", 0))
+        verify_alive = int(s.get("verify_alive", 0))
+        verify_invalid = int(s.get("verify_invalid", 0))
+        verify_noport = int(s.get("verify_noport", 0))
         current_ip = str(s.get("current_ip", "-"))
         current_service = str(s.get("current_service", "-"))
         current_port = str(s.get("current_port", "-"))
@@ -3312,11 +3894,16 @@ def main_console():
 
         right_lines = [
             f"{C_W}状态:{C_CYAN}{run_status}{C_W} {panel_border}| {C_W}模式:{C_CYAN}{mode_text}{C_W} {panel_border}| {C_W}运行:{C_CYAN}{uptime}{C_W}",
+            f"{C_BOLD}{C_WARN}项目备注:{C_W} {C_BOLD}{C_TEXT}{(project_note or '未设置')[:46]}{C_W}",
             f"{C_W}PID:{C_CYAN}{int(s.get('pid', 0) or 0)}{C_W} {panel_border}| {C_W}队列深度:{C_CYAN}{queue_size}{C_W} {panel_border}| {C_W}喂入间隔:{C_CYAN}{feed_interval:.3f}s{C_W}",
             f"{C_W}扫描目标 IP:{C_CYAN}{current_ip}{C_W}",
             f"{C_W}扫描服务:{C_CYAN}{current_service}{C_W} {panel_border}| {C_W}当前端口:{C_CYAN}{current_port}{C_W}",
             f"{C_W}验真读取:{C_CYAN}{str(s.get('verify_line', '-'))[:58]}{C_W}",
-            f"{C_W}端口装载 XUI:{C_CYAN}{xui_ports_total}{C_W} {panel_border}| {C_W}S5:{C_CYAN}{s5_ports_total}{C_W}",
+            (
+                f"{C_W}验真探测 存活:{C_CYAN}{verify_alive}{C_W}/{verify_checked} {panel_border}| {C_W}无效:{C_WARN}{verify_invalid}{C_W} 缺端口:{C_WARN}{verify_noport}{C_W}"
+                if int(s.get("mode", 0) or 0) == 4
+                else f"{C_W}端口装载 XUI:{C_CYAN}{xui_ports_total}{C_W} {panel_border}| {C_W}S5:{C_CYAN}{s5_ports_total}{C_W}"
+            ),
             f"{C_W}字典口令加载:{C_CYAN}{tokens_loaded}{C_W} 条",
             f"{C_W}跳过统计 断点:{C_CYAN}{skipped_resume}{C_W} {panel_border}| 历史:{C_CYAN}{skipped_history}{C_W}",
             f"{C_W}连接占用 Socket:{C_CYAN}{socket_in_use}{C_W}/{socket_limit}",
@@ -3355,6 +3942,9 @@ def main_console():
                     (16, "分类清理"),
                     (17, "无L7列表"),
                     (18, "一键清理"),
+                    (19, "初始化"),
+                    (20, "项目备注"),
+                    (21, "IP库"),
                 ],
             ),
             ("系统", [(0, "退出")]),
@@ -3406,7 +3996,7 @@ def main_console():
                 print(f"{C_DIM}建议目标格式: IP:PORT（如 1.2.3.4:2053）{C_W}")
             else:
                 wm = prompt_int(
-                    "深度 (1.探索 / 2.探索+验真 / 3.直跑验真): ",
+                    "深度 (1.探索 / 2.探索+验真 / 3.只留极品): ",
                     default=2,
                     min_value=1,
                     max_value=3,
@@ -3414,24 +4004,43 @@ def main_console():
             th = prompt_int(
                 "线程 (默认 1000): ", default=1000, min_value=1, max_value=1000
             )
-            default_ports = (
-                DEFAULT_XUI_PORTS
-                if m == 1
-                else DEFAULT_S5_PORTS
-                if m == 2
-                else DEFAULT_MIXED_PORTS
-            )
-            if m in (2, 3):
-                seg = input("端口段 (1=低段默认 / 2=高段, 默认1): ").strip()
-                if seg == "2":
-                    default_ports = (
-                        DEFAULT_S5_PORTS_HIGH if m == 2 else DEFAULT_MIXED_PORTS_HIGH
+            if m == 4:
+                token_count = len(load_tokens_list())
+                if token_count <= 0:
+                    print(
+                        f"{C_WARN}未读取到 tokens.list/pass.txt，有效口令为 0，已取消启动{C_W}"
                     )
-            ps = input(f"端口 (默认 {default_ports[:20]}...): ") or default_ports
-            if not parse_ports(ps):
-                print("端口无效")
-                time.sleep(1)
-                continue
+                    time.sleep(1.2)
+                    continue
+                ps = ""
+                print(f"{C_DIM}验真模式已忽略端口输入，将优先使用文件中的 IP:PORT{C_W}")
+                print(f"{C_DIM}当前口令数: {token_count}{C_W}")
+            else:
+                default_ports = (
+                    DEFAULT_XUI_PORTS
+                    if m == 1
+                    else DEFAULT_S5_PORTS
+                    if m == 2
+                    else DEFAULT_MIXED_PORTS
+                )
+                if m in (2, 3):
+                    seg = input("端口段 (1=低段默认 / 2=高段, 默认1): ").strip()
+                    if seg == "2":
+                        default_ports = (
+                            DEFAULT_S5_PORTS_HIGH
+                            if m == 2
+                            else DEFAULT_MIXED_PORTS_HIGH
+                        )
+                preset_ports = parse_ports(default_ports)
+                preview = ",".join(str(x) for x in preset_ports[:12])
+                print(
+                    f"{C_DIM}默认预设共 {len(preset_ports)} 个端口，预览: {preview}{'...' if len(preset_ports) > 12 else ''}{C_W}"
+                )
+                ps = input("端口 (回车使用默认预设): ").strip() or default_ports
+                if not parse_ports(ps):
+                    print("端口无效")
+                    time.sleep(1)
+                    continue
             fi = prompt_float(
                 "喂IP间隔秒 (默认0.02, 0=最快): ", default=0.02, min_value=0.0
             )
@@ -3608,13 +4217,26 @@ def main_console():
                 if m == 2
                 else DEFAULT_MIXED_PORTS
             )
-            if m in (2, 3):
-                seg = input("端口段 (1=低段默认 / 2=高段, 默认1): ").strip()
-                if seg == "2":
+            if m == 1:
+                psel = input("端口预设 (1=默认 / 2=FOFA热门100, 默认1): ").strip()
+                if psel == "2":
+                    default_ports = DEFAULT_FOFA_TOP100_PORTS
+            else:
+                psel = input(
+                    "端口预设 (1=低段默认 / 2=高段 / 3=FOFA热门100, 默认1): "
+                ).strip()
+                if psel == "2":
                     default_ports = (
                         DEFAULT_S5_PORTS_HIGH if m == 2 else DEFAULT_MIXED_PORTS_HIGH
                     )
-            ps = input(f"端口 (默认 {default_ports[:20]}...): ") or default_ports
+                elif psel == "3":
+                    default_ports = DEFAULT_FOFA_TOP100_PORTS
+            preset_ports = parse_ports(default_ports)
+            preview = ",".join(str(x) for x in preset_ports[:12])
+            print(
+                f"{C_DIM}默认预设共 {len(preset_ports)} 个端口，预览: {preview}{'...' if len(preset_ports) > 12 else ''}{C_W}"
+            )
+            ps = input("端口 (回车使用默认预设): ").strip() or default_ports
             if not parse_ports(ps):
                 print("端口无效")
                 time.sleep(1)
@@ -3884,13 +4506,203 @@ def main_console():
             if sure == "0":
                 continue
             if sure == "y":
-                stopped, removed = one_key_cleanup()
+                stopped, removed, mem_info = one_key_cleanup()
+                freed_mb = (
+                    mem_info.get("freed_mb") if isinstance(mem_info, dict) else None
+                )
+                trim_flag = (
+                    bool(mem_info.get("trimmed"))
+                    if isinstance(mem_info, dict)
+                    else False
+                )
+                mem_msg = (
+                    f"可用内存变化 {freed_mb:+.1f}MB"
+                    if isinstance(freed_mb, (int, float))
+                    else "可用内存变化 -"
+                )
                 print(
-                    f"{C_SUCC}>>> 清理完成: 停止进程 {stopped} 个, 删除文件 {removed} 个{C_W}"
+                    f"{C_SUCC}>>> 清理完成: 停止进程 {stopped} 个, 删除文件 {removed} 个, {mem_msg}, 内存回收:{'ON' if trim_flag else 'OFF'}{C_W}"
+                )
+                print(
+                    f"{C_DIM}说明: 该操作回收本进程内存，系统文件缓存不一定立刻下降。{C_W}"
                 )
             else:
                 print(f"{C_DIM}已取消{C_W}")
             time.sleep(1.2)
+
+        elif c == "19":
+            print(f"\n{C_WARN}>>> 初始化环境（对齐 hk.txt 的初始化思路）{C_W}")
+            print(
+                f"{C_DIM}会停止审计/守护并清理运行痕迹；默认保留 IP/Tokens 配置。{C_W}"
+            )
+            keep_profile_in = (
+                input("是否保留用户配置(IP/Tokens/通知配置)? (y/n, 默认y): ")
+                .strip()
+                .lower()
+            )
+            keep_profile = keep_profile_in != "n"
+            keep_ports_in = input("是否保留端口配置? (y/n, 默认y): ").strip().lower()
+            keep_ports = keep_ports_in != "n"
+            sure = input("确认执行初始化? (y/n): ").strip().lower()
+            if sure == "y":
+                rst = init_account_environment(
+                    keep_profile=keep_profile,
+                    keep_ports=keep_ports,
+                )
+                mem_info = rst.get("mem_info", {}) if isinstance(rst, dict) else {}
+                freed_mb = (
+                    mem_info.get("freed_mb") if isinstance(mem_info, dict) else None
+                )
+                mem_msg = (
+                    f"可用内存变化 {freed_mb:+.1f}MB"
+                    if isinstance(freed_mb, (int, float))
+                    else "可用内存变化 -"
+                )
+                print(
+                    f"{C_SUCC}>>> 初始化完成: 停止进程 {rst.get('stopped', 0)} 个, "
+                    f"清理运行文件 {rst.get('removed_runtime', 0)} 个, "
+                    f"清理配置 {rst.get('removed_profile', 0)} 个, {mem_msg}, "
+                    f"保留端口:{'ON' if keep_ports else 'OFF'}{C_W}"
+                )
+            else:
+                print(f"{C_DIM}已取消{C_W}")
+            time.sleep(1.2)
+
+        elif c == "20":
+            old_note = load_project_note()
+            print(f"\n{C_CYAN}>>> 项目备注{C_W}")
+            print(f"当前备注: {C_BOLD}{C_TEXT}{old_note or '未设置'}{C_W}")
+            print(
+                f"{C_DIM}输入新备注并回车保存；输入 clear 清空；直接回车保持不变。{C_W}"
+            )
+            new_note = input("新备注: ").strip()
+            if not new_note:
+                print(f"{C_DIM}备注未修改{C_W}")
+            elif new_note.lower() == "clear":
+                save_project_note("")
+                print(f"{C_SUCC}>>> 已清空项目备注{C_W}")
+            else:
+                save_project_note(new_note)
+                print(f"{C_SUCC}>>> 备注已更新{C_W}")
+            time.sleep(1.2)
+
+        elif c == "21":
+            while True:
+                cfg = load_iplib_config()
+                lib_n = iplib_count()
+                os.system("cls" if os.name == "nt" else "clear")
+                print(f"\n{C_CYAN}>>> IP库管理 ({IPLIB_FILE}){C_W}")
+                print(
+                    f"状态: {'自动续跑ON' if cfg.get('enabled') else '自动续跑OFF'} | "
+                    f"每轮提取行数: {cfg.get('batch_size', 1) or 1} (1=一次一行, 0=全部) | 库内行数: {lib_n}"
+                )
+                print("1) 覆盖写入 IP库")
+                print("2) 追加写入 IP库")
+                print(f"3) 将当前 {NODE_FILE} 追加到 IP库")
+                print("4) 清空 IP库")
+                print("5) 切换 自动续跑 开/关")
+                print("6) 设置 每轮提取行数")
+                print(f"7) 立即从 IP库 提取到 {NODE_FILE}")
+                sel = input("请选择 (回车返回): ").strip()
+                if sel == "":
+                    break
+
+                if sel == "1":
+                    print(f"\n{C_CYAN}>>> 覆盖写入 IP库{C_W}")
+                    tokens = read_list_tokens_from_input(split_spaces=True)
+                    if tokens is None:
+                        time.sleep(0.8)
+                        continue
+                    ok, n = iplib_overwrite(tokens)
+                    if ok:
+                        print(f"{C_SUCC}>>> IP库已更新，共 {n} 条{C_W}")
+                    else:
+                        print(f"{C_WARN}>>> 写入失败{C_W}")
+                    time.sleep(1.0)
+
+                elif sel == "2":
+                    print(f"\n{C_CYAN}>>> 追加写入 IP库{C_W}")
+                    tokens = read_list_tokens_from_input(split_spaces=True)
+                    if tokens is None:
+                        time.sleep(0.8)
+                        continue
+                    ok, n = iplib_append(tokens)
+                    if ok:
+                        print(f"{C_SUCC}>>> 已追加，库内共 {n} 条{C_W}")
+                    else:
+                        print(f"{C_WARN}>>> 写入失败{C_W}")
+                    time.sleep(1.0)
+
+                elif sel == "3":
+                    cur = _read_tokens_flat(NODE_FILE)
+                    if not cur:
+                        print(f"{C_WARN}>>> {NODE_FILE} 为空或不存在{C_W}")
+                        time.sleep(1.0)
+                        continue
+                    ok, n = iplib_append(cur)
+                    if ok:
+                        print(
+                            f"{C_SUCC}>>> 已从 {NODE_FILE} 追加到 IP库，库内共 {n} 行{C_W}"
+                        )
+                    else:
+                        print(f"{C_WARN}>>> 写入失败{C_W}")
+                    time.sleep(1.0)
+
+                elif sel == "4":
+                    sure = input("确认清空 IP库? (y/n): ").strip().lower()
+                    if sure == "y":
+                        ok = iplib_clear()
+                        print(
+                            f"{C_SUCC if ok else C_WARN}>>> IP库已清空{C_W}"
+                            if ok
+                            else f"{C_WARN}>>> 清空失败{C_W}"
+                        )
+                    else:
+                        print(f"{C_DIM}已取消{C_W}")
+                    time.sleep(1.0)
+
+                elif sel == "5":
+                    cfg["enabled"] = not bool(cfg.get("enabled"))
+                    save_iplib_config(cfg)
+                    print(
+                        f"{C_SUCC}>>> 自动续跑已{'开启' if cfg['enabled'] else '关闭'}{C_W}"
+                    )
+                    time.sleep(1.0)
+
+                elif sel == "6":
+                    bs = prompt_int(
+                        "每轮提取行数 (1=一次一行, 0=全部): ",
+                        default=int(cfg.get("batch_size", 1) or 1),
+                        min_value=0,
+                        max_value=100000000,
+                    )
+                    cfg["batch_size"] = bs
+                    save_iplib_config(cfg)
+                    print(f"{C_SUCC}>>> 已保存: 每轮提取行数 {bs}{C_W}")
+                    time.sleep(1.0)
+
+                elif sel == "7":
+                    take, left = iplib_pop_to_nodes(cfg.get("batch_size", 0))
+                    if take <= 0:
+                        print(f"{C_WARN}>>> IP库为空或提取失败{C_W}")
+                    else:
+                        print(
+                            f"{C_SUCC}>>> 已提取 {take} 行到 {NODE_FILE}，IP库剩余 {left} 行{C_W}"
+                        )
+                        reload_now = (
+                            input("是否立即重载当前审计任务? (y/n): ").strip().lower()
+                        )
+                        if reload_now == "y":
+                            ok, detail = reload_running_audit()
+                            if ok:
+                                print(f"{C_SUCC}>>> {detail}{C_W}")
+                            else:
+                                print(f"{C_WARN}>>> 重载失败: {detail}{C_W}")
+                    time.sleep(1.2)
+
+                else:
+                    print(f"{C_WARN}无效选项{C_W}")
+                    time.sleep(1.0)
 
         elif c == "13":
             print(f"\n{C_CYAN}>>> 更换 IP 列表 ({NODE_FILE}){C_W}")
@@ -3974,11 +4786,12 @@ if __name__ == "__main__":
             raise SystemExit("已有审计进程运行中")
         mode, work_mode, threads = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
         ports, feed_int = parse_ports(sys.argv[5]), float(sys.argv[6])
+        needs_ports = mode in (1, 2, 3)
         if (
             mode not in (1, 2, 3, 4)
             or work_mode not in (1, 2, 3)
             or threads < 1
-            or not ports
+            or (needs_ports and not ports)
             or feed_int < 0
         ):
             raise SystemExit("Err")
@@ -3986,11 +4799,38 @@ if __name__ == "__main__":
             asyncio.run(
                 internal_audit_process(mode, work_mode, threads, ports, feed_int)
             )
+            ran_ok = True
         except Exception:
+            ran_ok = False
             log_exception("fatal crash in run mode")
             raise
         finally:
             release_run_lock()
+
+        # 任务正常结束后: 自动从 IP 库提取并继续跑同一模式
+        if ran_ok:
+            try:
+                cfg = load_iplib_config()
+                if cfg.get("enabled"):
+                    take, left = iplib_pop_to_nodes(cfg.get("batch_size", 0))
+                    if take > 0:
+                        log_event(f"IPLIB auto-continue: extracted {take}, left {left}")
+                        mark_manual_launch_window(20)
+                        subprocess.Popen(
+                            [
+                                sys.executable,
+                                __file__,
+                                "run",
+                                str(mode),
+                                str(work_mode),
+                                str(threads),
+                                str(sys.argv[5]),
+                                str(feed_int),
+                            ],
+                            start_new_session=True,
+                        )
+            except Exception:
+                log_exception("iplib auto-continue failed")
     elif len(sys.argv) > 1 and sys.argv[1] == "guardian":
         # ... (参数解析逻辑保持一致)
         if len(sys.argv) < 6:
