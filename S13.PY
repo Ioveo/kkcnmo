@@ -3268,8 +3268,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 if mode in (1, 3):
                     hit = False
                     xui_ports_list = list(xui_ports)
-                    for i in range(0, len(xui_ports_list), 30):
-                        batch = xui_ports_list[i:i+30]
+                    for i in range(0, len(xui_ports_list), 5):
+                        batch = xui_ports_list[i:i+5]
                         async with state_lock:
                             state["current_service"] = "XUI"
                             state["current_port"] = f"batch({len(batch)})"
@@ -3289,8 +3289,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 if mode in (2, 3):
                     hit = False
                     s5_ports_list = list(s5_ports)
-                    for i in range(0, len(s5_ports_list), 30):
-                        batch = s5_ports_list[i:i+30]
+                    for i in range(0, len(s5_ports_list), 5):
+                        batch = s5_ports_list[i:i+5]
                         async with state_lock:
                             state["current_service"] = "S5"
                             state["current_port"] = f"batch({len(batch)})"
@@ -3310,8 +3310,8 @@ async def internal_audit_process(mode, work_mode, threads, ports, feed_int):
                 if mode == 4:
                     verify_ports = [forced_port] if forced_port else list(ports)
                     verified_hit = False
-                    for i in range(0, len(verify_ports), 30):
-                        batch = verify_ports[i:i+30]
+                    for i in range(0, len(verify_ports), 5):
+                        batch = verify_ports[i:i+5]
                         async with state_lock:
                             state["current_service"] = "TCP-CHECK"
                             state["current_port"] = f"batch({len(batch)})"
